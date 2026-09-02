@@ -1,14 +1,15 @@
 # LKlight-GPU
 
-**LKlight GPU（CUDA）版（v4 最终版）** —— 全功能分子对接引擎，Linux + NVIDIA 驱动
-即用；无 GPU 时自动回退 CPU 网格路径，功能与 `../LKlight-grid` 完全等价。
+**LKlight GPU（CUDA）版（v4 最终版）** —— 全功能分子对接引擎，**Windows 与 Linux +
+NVIDIA 驱动即用**；无 GPU 时自动回退 CPU 网格路径，功能与 `../LKlight-grid` 完全等价。
 
 LKlight 是 Python LightDock（GSO 群智能对接）的 Rust 高性能实现；本目录是 **CUDA
 批量加速最终版**的独立发布项目：打分 kernel 把 ≤10Å 近距（cell-list 扫描、clamp
 静电、LJ、clash 罚）与 10–30Å 远距场合并，**整步全部构象一次 kernel launch**
 （gridDim.y = 构象数），并把刚体坐标变换放到 device（每步只上传 N×7 个 pose 参数）。
 大规模（≥300 构象/步、长步数）下相对 CPU 网格再快 1.6–2.4×，单 swarm 可扛 5000
-glowworm 近乎线性扩展。
+glowworm 近乎线性扩展。**Windows 版已在 RTX 2080 真机实测 `CUDA BATCH ACTIVE`；
+Linux 版在 RTX 3080 Ti 实测。**
 
 ## 一、功能清单（与 CPU 网格版完全一致，无遗漏）
 
@@ -23,11 +24,12 @@ glowworm 近乎线性扩展。
 - **高级功能**：ANM、restraints、膜、GSO 邻居分箱+并行、`tools/run_parallel.py`
   swarm 并行、clash/扫描体检工具——全部保留。
 
-## 二、换机即用（仅 Linux；本版本只发布 Linux CUDA）
+## 二、换机即用
 
 | 文件 | 平台 | 运行时依赖 | 说明 |
 |---|---|---|---|
 | `release_bin/LKlight-linux-cuda` | Linux x86-64 | **仅 NVIDIA 驱动**（CUDA 运行库已静态链入，无需装 Toolkit）| 有 GPU → 批量加速；无 GPU/驱动 → 自动 CPU |
+| `release_bin/LKlight-win64-cuda.exe` | Windows 10/11 x64 | **仅 NVIDIA 驱动**（静态链 cudart，无 CUDA Toolkit 依赖）| RTX 2080 真机实测 ACTIVE；无 GPU 自动回退 CPU |
 
 验证：
 ```bash
@@ -36,9 +38,9 @@ glowworm 近乎线性扩展。
 # 没有该行 → CPU 网格模式（结果等价，仅速度不同）
 ```
 
-> Windows/macOS 目前使用 CPU 网格版（见 `../LKlight-grid`）；如需 Windows/mac 的
-> CUDA 构建需另行交叉编译（本目录源码支持 `--features cuda` 任意平台，前提是本机
-> 有对应平台 nvcc）。
+> macOS（Apple Silicon）无 NVIDIA 硬件，使用 CPU 网格版（见 `../LKlight-grid`）。
+> Windows CUDA 版需在 Windows + NVIDIA 驱动机器上运行；源码 `--features cuda`
+> 支持任意平台构建，前提是本机有对应平台 nvcc + MSVC/VC 环境。
 
 ## 三、快速上手
 
