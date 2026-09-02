@@ -1,7 +1,12 @@
-// build.rs — compiles src/cuda/far_field.cu with nvcc when the `cuda` feature
-// is enabled. Produces a static archive consumed by cargo:
-//   target/cuda/libfarfield.a   (linked as `static=farfield`)
-// and links the CUDA runtime (cudart) found next to nvcc.
+// build.rs — compiles src/cuda/*.cu with nvcc when the `cuda` feature is
+// enabled, archives them, and links the CUDA runtime found next to nvcc.
+//
+//   Linux:   nvcc -c -> .o, ar crs libfarfield.a, static libcudart_static.a
+//            (binary then only needs the NVIDIA *driver*; portable across
+//             GPU machines). Falls back to dynamic libcudart.so.
+//   Windows: nvcc -c -> .obj, lib /OUT:libfarfield.lib (needs the MSVC/VC
+//            environment, i.e. run inside a "vcvars64" prompt), static
+//            cudart_static.lib from %CUDA_PATH%\lib\x64.
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -15,19 +20,22 @@ fn main() {
         return;
     }
 
-    // Locate nvcc (respect NVCC env override).
     let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
-
-    // out dir for the objects + archive
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     std::fs::create_dir_all(&out_dir).unwrap();
-    let lib = out_dir.join("libfarfield.a");
+    let is_win = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let obj_ext = if is_win { "obj" } else { "o" };
+    let lib = if is_win {
+        out_dir.join("farfield.lib")
+    } else {
+        out_dir.join("libfarfield.a")
+    };
 
-    // Compile every kernel under src/cuda/ with nvcc.
+    // 1) nvcc: compile each kernel.
     let mut objs: Vec<PathBuf> = Vec::new();
     for src in ["src/cuda/far_field.cu", "src/cuda/full_score.cu"] {
         let stem = src.rsplit('/').next().unwrap().replace(".cu", "");
-        let obj = out_dir.join(format!("{stem}.o"));
+        let obj = out_dir.join(format!("{stem}.{obj_ext}"));
         let status = Command::new(&nvcc)
             .args(["-O3", "-arch=native", "-c"])
             .arg(src)
@@ -41,42 +49,65 @@ fn main() {
         objs.push(obj);
     }
 
-    // Archive all objects (ar, as used by the toolchain).
-    let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
-    let mut cmd = Command::new(&ar);
-    cmd.args(["crs"]).arg(&lib);
-    for o in &objs {
-        cmd.arg(o);
-    }
-    let status = cmd.status().expect("failed to spawn ar");
-    if !status.success() {
-        panic!("ar failed to create {lib:?}");
-    }
-
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=farfield");
-    // nvcc emits C++-flavoured objects (device stubs use __cxa_guard /
-    // __gxx_personality) → link the C++ runtime too.
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    // Prefer the *static* CUDA runtime (libcudart_static.a): the resulting binary
-    // then only needs the NVIDIA *driver* (libcuda.so, installed with any GPU
-    // driver) — no CUDA toolkit install required on the target machine, which
-    // makes the CUDA build portable across GPU machines. If the static archive
-    // is absent we fall back to dynamic cudart.
-    let static_cudart = find_libdir("cudart_static.a");
-    let libdir = find_libdir("libcudart.so");
-    if let Some(dir) = static_cudart {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-        println!("cargo:rustc-link-lib=static=cudart_static");
-        println!("cargo:rustc-link-lib=dylib=dl");
-        println!("cargo:rustc-link-lib=dylib=pthread");
-        println!("cargo:rustc-link-lib=dylib=rt");
-    } else if let Some(dir) = libdir {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-        println!("cargo:rustc-link-lib=dylib=cudart");
+    // 2) Archive the objects.
+    if is_win {
+        // Microsoft librarian (requires the VC environment / vcvars64).
+        let lib_exe = std::env::var("LIBEXE").unwrap_or_else(|_| "lib".to_string());
+        let mut cmd = Command::new(&lib_exe);
+        cmd.arg(format!("/OUT:{}", lib.display()));
+        for o in &objs {
+            cmd.arg(o);
+        }
+        let status = cmd.status().expect("failed to spawn lib.exe — run inside a VS developer prompt");
+        if !status.success() {
+            panic!("lib.exe failed to create {lib:?}");
+        }
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static=farfield");
     } else {
-        panic!("CUDA feature enabled but neither libcudart_static.a nor libcudart.so found; set CUDA_PATH or install the CUDA toolkit");
+        let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
+        let mut cmd = Command::new(&ar);
+        cmd.args(["crs"]).arg(&lib);
+        for o in &objs {
+            cmd.arg(o);
+        }
+        let status = cmd.status().expect("failed to spawn ar");
+        if !status.success() {
+            panic!("ar failed to create {lib:?}");
+        }
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static=farfield");
+        // nvcc emits C++-flavoured objects (__cxa_guard / __gxx_personality).
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
+
+    // 3) CUDA runtime — prefer static cudart so the target machine only needs
+    //    the NVIDIA driver.
+    if is_win {
+        if let Some(dir) = find_libdir_win("cudart_static.lib") {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=cudart_static");
+        } else if let Some(dir) = find_libdir_win("cudart.lib") {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=dylib=cudart");
+        } else {
+            panic!("CUDA feature enabled but no cudart_static.lib/cudart.lib under %CUDA_PATH%\\lib\\x64");
+        }
+    } else {
+        let static_cudart = find_libdir("cudart_static.a");
+        let libdir = find_libdir("libcudart.so");
+        if let Some(dir) = static_cudart {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=cudart_static");
+            println!("cargo:rustc-link-lib=dylib=dl");
+            println!("cargo:rustc-link-lib=dylib=pthread");
+            println!("cargo:rustc-link-lib=dylib=rt");
+        } else if let Some(dir) = libdir {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=dylib=cudart");
+        } else {
+            panic!("CUDA feature enabled but neither libcudart_static.a nor libcudart.so found; set CUDA_PATH or install the CUDA toolkit");
+        }
     }
 }
 
@@ -99,6 +130,26 @@ fn find_libdir(file: &str) -> Option<PathBuf> {
         for cand in ["lib64", "lib"] {
             let d = root.join(cand);
             if d.join(file).exists() || d.join(format!("lib{}", file)).exists() {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Windows: look under %CUDA_PATH%\lib\x64 (plus %CUDA_PATH% itself).
+fn find_libdir_win(file: &str) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cp) = std::env::var("CUDA_PATH") {
+        roots.push(PathBuf::from(&cp));
+    }
+    if let Ok(programs) = std::env::var("ProgramFiles") {
+        roots.push(PathBuf::from(&programs).join("NVIDIA GPU Computing Toolkit\\CUDA"));
+    }
+    for root in roots {
+        for cand in ["lib\\x64", "lib", ""] {
+            let d = root.join(cand);
+            if d.join(file).exists() {
                 return Some(d);
             }
         }
