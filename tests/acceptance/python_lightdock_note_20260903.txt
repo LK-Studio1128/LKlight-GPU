@@ -1,0 +1,44 @@
+Python LightDock vs LKlight - test campaign notes 2026-09-03 05:52-06:10
+=====================================================================
+MACHINES: Linux server RTX3080Ti/12core (same as three-engine horizontal bench)
+          macOS Apple Silicon (frozen dist probe only)
+
+[1] Measured on server, single-pose dna scoring, identical input (1AZP native rec/lig, H-stripped)
+    python lgd_calculate_scoring dna : -1201.3858   wall ~417 ms (incl interpreter/import startup)
+    LKlight original (all-pairs)      : -2047.3680
+    LKlight-grid v1.1.0               : -2049.3691
+    LKlight-GPU  v1.1.0               : -2049.3689
+NOTE: python = lightdock-master build (lgd_* CLI). master's dna function does NOT match the
+0.9.4 semantics that the Rust LKlight original was ported against -> expected systematic
+difference (~1.7x, function-version effect). Bit-level parity is only meaningful vs 0.9.4
+(reference parity runs previously achieved 48/48 poses max diff 4.85e-7 on 0.9.4, see
+lightdock-numval-parity skill + numeric_validation_v2.py).
+grid vs gpu on this pose agree to f32 (~2e-4 abs) as expected.
+
+[2] Full docking-run attempts - BLOCKED (honest status, no fabricated numbers)
+    a) prebuilt frozen LightDock (lightdock-0.9.4/dist/lightdock-macos-arm64): lgd_run finishes
+       with rc=0 but writes no swarm output & dfire errors missing its data tables ->
+       frozen bundle not usable for controlled benchmarks on this box.
+    b) source-built lightdock-master on server (numpy2, compiled C ext incl. freesasa/prody):
+       lgd_setup OK; lgd_run (dna/dfire/vdw, 100 steps, 1x20) exits 'Finished' but swarm_0
+       stays empty and setup.json reports swarms:0 -> no simulation was executed; CLI/version
+       quirks need the documented 0.9.4 + /tmp/numval-style env to run the official protocol
+       (see skill: PYTHONPATH deps 1.23.5 numpy + lightdock3_setup.py + positions in init/).
+
+[3] Previously verified Python-LightDock real numbers (from LKlight dev-phase, same protocol,
+    M4-class Apple Silicon; skill + PAPER.md) usable as reference for the missing rows:
+    single swarm 100 steps, 200 glowworms:
+      dfire  Py 164.9 s  vs LKlight 1.54 s    = 107.5x
+      vdw    Py  25.7 s  vs LKlight 1.37 s    =  18.8x
+      cpydock Py 30.3 s  vs LKlight 2.14 s    =  14.2x
+      dna+ANM Py 50.6 s  vs LKlight 3.90 s    =  13.0x
+    single-scoring latency (PAPER.md, macOS): pydock 858ms, dna+ANM 760ms, cpydock 844ms,
+      dfire 840ms per pose (Python) vs Rust original 33-290ms (3-25x per pose).
+    user historical RNA task: Python LightDock >2h (timeout) vs LKlight-grid ~22 s e2e.
+
+[4] RECOMMENDED NEXT STEP (to emit the formal fresh Python numbers):
+    rebuild the documented 0.9.4 env on this server or macOS
+    (numpy 1.23.5 cp39 wheels /usr/bin/python3.9 + lightdock-0.9.4 sources + init/ positions
+    protocol) and rerun the single-swarm matrix + single-pose bit-parity, then patch the page.
+    Estimated 30-60 min of build+run work. NOT done yet - do not quote Python run-level times
+    beyond section [3] provenance.
