@@ -1,0 +1,4 @@
+===MAC-ACCEPT===
+exact run_100s 0.60 rc=0
+grid run_100s 0.00 rc=0
+grid run_100s 0.45 rc=0 gso=OK

@@ -1,0 +1,8 @@
+===LINUX-ACCEPT===
+exact run_100s 1.13
+Wrote 20 to rank_by_rmsd.list
+grid run_100s 1.17
+Wrote 20 to rank_by_rmsd.list
+[gpu_score] CUDA BATCH scoring ACTIVE (20 poses × 506 atoms)
+gpu run_100s 1.30
+Wrote 20 to rank_by_rmsd.list

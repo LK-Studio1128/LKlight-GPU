@@ -1,0 +1,60 @@
+===WIN-ACCEPT-CPU=== 
+Reading receptor: 1azp_receptor.pdb
+Reading ligand:   1azp_ligand.pdb
+Atom filters [noh=false noxt=true now=true]: removed 0 receptor / 0 ligand atoms
+Receptor CoM: [9.586,9.389,15.980]  Ligand CoM: [5.649,16.484,3.160]
+Saved lightdock_1azp_receptor.pdb and lightdock_1azp_ligand.pdb
+Created 2 swarms 脳 20 glowworms. Written setup.json.
+setup_done 2026/09/03 周四  4:53:28.75  
+run swarm 0  
+Reading starting positions from "initial_positions_0.dat"
+Swarm ID 0
+Writing to swarm dir "swarm_0"
+Reading receptor: lightdock_1azp_receptor.pdb
+Reading ligand: lightdock_1azp_ligand.pdb
+Loading DNA scoring function
+Creating GSO with 20 glowworms
+Starting optimization (100 steps)
+cpu_runs_done 2026/09/03 周四  4:53:28.75  
+Collected 20 solutions
+Wrote 20 solutions to ranking.list
+Wrote 20 solutions to rank_by_scoring.list
+Wrote 20 solutions to rank_by_luciferin.list
+Wrote 20 to rank_by_rmsd.list
+===WIN-ACCEPT-GPU===  
+Reading starting positions from "initial_positions_0.dat"
+Swarm ID 0
+Writing to swarm dir "swarm_0"
+Reading receptor: lightdock_1azp_receptor.pdb
+Reading ligand: lightdock_1azp_ligand.pdb
+Loading DNA scoring function
+Creating GSO with 20 glowworms
+Starting optimization (100 steps)
+[gpu_score] CUDA BATCH scoring ACTIVE (20 poses 脳 506 atoms)
+gpu_100_done 2026/09/03 周四  4:53:28.75  
+run swarm 1  
+Reading starting positions from "initial_positions_1.dat"
+Swarm ID 1
+Writing to swarm dir "swarm_1"
+Reading receptor: lightdock_1azp_receptor.pdb
+Reading ligand: lightdock_1azp_ligand.pdb
+Loading DNA scoring function
+Creating GSO with 20 glowworms
+Starting optimization (100 steps)
+cpu_runs_done 2026/09/03 周四  4:53:28.75  
+Collected 40 solutions
+Wrote 40 solutions to ranking.list
+Wrote 40 solutions to rank_by_scoring.list
+Wrote 40 solutions to rank_by_luciferin.list
+Wrote 40 to rank_by_rmsd.list
+===WIN-ACCEPT-GPU===  
+Reading starting positions from "initial_positions_0.dat"
+Swarm ID 0
+Writing to swarm dir "swarm_0"
+Reading receptor: lightdock_1azp_receptor.pdb
+Reading ligand: lightdock_1azp_ligand.pdb
+Loading DNA scoring function
+Creating GSO with 20 glowworms
+Starting optimization (100 steps)
+[gpu_score] CUDA BATCH scoring ACTIVE (20 poses 脳 506 atoms)
+gpu_100_done 2026/09/03 周四  4:53:28.75  
