@@ -1,4 +1,4 @@
-# 01 原版 exact（LKlight 基线）
+# 01 原版（original）（LKlight 基线）
 
 ## 概述
 

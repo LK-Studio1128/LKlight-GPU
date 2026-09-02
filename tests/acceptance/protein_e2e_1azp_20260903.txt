@@ -1,0 +1,8 @@
+LKlight protein-DNA (1AZP) end-to-end benchmark - 2026-09-03 (macOS, native build)
+Scenario: 6 swarms x 20 glowworms x 100 steps, dna scoring, seed 42
+Full pipeline: setup -> 6x run -> rank -> 6x generate
+
+original (all-pairs reference engine) : 5.01 s  (120 solutions, gso 6/6)
+LKlight-grid v1.1.0 (CPU grid)        : 2.56 s  (120 solutions, gso 6/6)
+Speedup: 1.96x on this small protein-DNA system.
+(Single-swarm x 100 steps acceptance: original 0.60 s / grid 0.45 s.)

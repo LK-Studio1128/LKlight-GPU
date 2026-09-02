@@ -1,6 +1,6 @@
 # LKlight-GPU
 
-**CUDA-batched docking engine — LKlight v4 (final).** Full-featured molecular
+**CUDA-batched docking engine — LKlight-GPU v1.1.0.** Full-featured molecular
 docking for protein–nucleic-acid and protein–protein complexes with
 **NVIDIA-GPU batching on Windows and Linux**. No GPU present? The same binary
 silently falls back to the CPU grid path (functionally identical to
@@ -41,7 +41,7 @@ an RTX 2080 (`CUDA BATCH ACTIVE`), Linux CUDA on an RTX 3080 Ti.
 | Guarantee | Value |
 |---|---|
 | GPU batch vs CPU grid | < 1e-5 (f32 rounding); convergence statistically identical |
-| CPU grid vs original exact | far-field interpolation only: ≤ 0.5 % bound poses; top-5 pose overlap 100 % (±2 Å) |
+| CPU grid vs original | far-field interpolation only: ≤ 0.5 % bound poses; top-5 pose overlap 100 % (±2 Å) |
 | Cross-platform reproducibility | same pose → identical score on Windows/Linux/macOS (vdw bit-identical) |
 
 ## Quick start

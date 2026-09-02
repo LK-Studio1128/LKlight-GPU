@@ -6,7 +6,7 @@ LKlight 是 Python LightDock 分子对接的 Rust 高性能重写：GSO（群智
 
 | 版本 | 代码线 | 打分方式 | 相对原版 | 状态 |
 |---|---|---|---|---|
-| [01 原版 exact](01_original_exact.md) | `byi/LKlight` | 全原子逐对 30Å | 1×（参考真值）| 已发布，软件在用 |
+| [01 原版（original）](01_original_exact.md) | `byi/LKlight` | 全原子逐对 30Å | 1×（参考真值）| 已发布，软件在用 |
 | [02 v1 网格场](02_v1_grid_l1.md) | `byi/LKlight-CUDA` | 近距逐对 + 远距 10–30Å 场查表 | 7× | 历史里程碑 |
 | [03 v2 cell-list](03_v2_cell_list.md) | `byi/LKlight-CUDA` | 配体扫受体 cell list | **19.4×**（累计）| 历史里程碑 |
 | [04 v3 GPU 批量 + GSO](04_v3_gpu_batch_gso.md) | `byi/LKlight-CUDA` | 整步构象一次 GPU kernel + 框架并行 | 高负载再 +1.6–2.4× | 历史里程碑 |
