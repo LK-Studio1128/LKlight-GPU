@@ -1,0 +1,42 @@
+LKlight three-engine horizontal benchmark - 2026-09-03 05:37-05:47
+Machines: Linux server RTX 3080 Ti + 12 cores (glibc/musl builds); Windows Server 2022 RTX 2080
+Engines: original (all-pairs reference, musl static) / LKlight-grid v1.1.0 (linux-x64 static-pie) / LKlight-GPU v1.1.0 (linux-cuda, win64-cuda)
+
+[P1] Protein-DNA 1AZP - Linux server (seconds)
+single 1 swarm x 20 x 100 steps : original 1.175 | grid 1.171 | gpu 1.276
+e2e 6 x 20 x 100 (setup+6run+rank+gen): original 7.164 | grid 7.349 | gpu 7.413 (gso 6/6 each)
+=> protein-scale systems: three engines at parity (per-swarm framework overhead ~1.2 s dominates)
+
+[P1w] Protein-DNA 1AZP - Windows (RTX 2080)
+e2e cpu 6.144 s | e2e gpu 7.246 s (CUDA BATCH ACTIVE each run, 20 poses x 506 atoms; gso 6/6)
+
+[P2] RNA large system (8218 + 12625 atoms) single swarm 20 glow x 100 steps
+original 79.079 s | grid 8.513 s (9.3x) | gpu 7.872 s (10.0x; gpu/grid 1.08x)
+
+[P3] 12 scorers x protein 100 steps - grid vs GPU binary
+outputs grid vs gpu: dfire/dfire2/ddna/mj3h/pydock/cpydock/sd/pisa/sipper/tobi/vdw BYTE-IDENTICAL; dna differs (f32 batch path)
+times: dna grid 1.182 gpu 1.277; pydock 1.077/1.045; cpydock 1.763/1.655; sd musl-static 11.5 vs glibc 1.28
+(original musl sd 10.55 => musl static libm pow is ~9x slower; results identical; dna/vdw/cpydock unaffected materially)
+
+[P4] RNA scale sweep, 50 steps each (seconds)
+N      original(meas)  original(extrap)  grid      gpu       gpu-vs-grid  gpu-vs-orig(extrap)
+20     40.706          -                 7.732     7.566     1.02x        5.4x
+40     61.415          -                 -         -         -            -
+50     -               -                 8.477     7.458     1.14x        -
+100    126.635         -                 9.602     7.811     1.23x        16.2x
+200    -               ~227              11.490    7.618     1.51x        ~30x
+500    -               ~537              16.742    7.890     2.12x        ~68x
+1000   -               ~1055             24.724    8.348     2.96x        ~126x
+2000   -               ~2090             41.842    9.117     4.59x        ~230x
+5000   -               -                 (est ~93) 11.492    ~8x          -
+10000  -               -                 -         11.375*   -            -   (*20 steps; ~57 s/100)
+fit: original adds ~1.04 s per extra glowworm per 50 steps -> linear, infeasible at scale
+gpu/grid crossover: >=2x from ~N 400; 4.6x at N=2000; GPU near-flat 7.5-9.1 s across N 20-2000
+
+[Limits / honest gaps]
+- protein-scale: engines at parity (framework overhead); GPU needs high pose-count x steps
+- GPU batch accelerates dna scorer only; other 11 scorers run CPU-grid path inside GPU binary (byte-identical, no GPU gain)
+- Linux static-pie musl libm pow slower for pow-heavy scorers (sd ~9x); dna/vdw unaffected; use glibc build if sd-heavy
+- macOS has no NVIDIA -> no CUDA engine there; Windows & Linux carry the GPU binaries
+- original reference scales linearly with N (RNA 100-step ~N100 2.1 min -> extrap N500 ~18 min, N1000 ~35 min)
+- GPU handles single swarm up to N=10000 (20 steps 11.4 s); 5000 is the documented comfortable ceiling
