@@ -228,7 +228,22 @@ __global__ void batch_full_score_kernel(
 {
     int pose = blockIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= nl) return;
+    // OPT (2026-09-05): per-block shared-memory reduction replaces one device
+    // atomicAdd per *ligand atom* with one atomicAdd per *block* into the pose
+    // accumulator. With gridDim.y = N poses x ~nl/256 blocks, this cuts the
+    // number of serialized atomic ops on each pose's out[pose*2] slot from ~nl
+    // to ~ceil(nl/256) — a large win at high batch throughput (N=1000). Out-of
+    // -range threads (partial last block) contribute 0 and still join the
+    // __syncthreads barrier. The per-atom physics (elec/vdw accumulators) is
+    // byte-for-byte identical to the single-pose full_score_kernel; only the
+    // intra-block summation order of the f32 atom locals changes (block-tree
+    // order instead of per-atom atomics), which stays within the same f32 round
+    // -off budget already accepted between GPU and CPU grid paths.
+    extern __shared__ float sm[];   // 2*blockDim.x floats: elec then vdw
+    float* s_elec = sm;
+    float* s_vdw  = sm + blockDim.x;
+    if (j >= nl) { s_elec[threadIdx.x] = 0.f; s_vdw[threadIdx.x] = 0.f; }
+    else {
     // Rigid transform on the device: v' = R(q)·v + t, in double precision so the
     // result matches the host-side f64 transform bit-for-bit before the f32 cast
     // (avoids uploading N*nl*3 transformed coords every step ~ 30 MB @ n=200).
@@ -292,8 +307,22 @@ __global__ void batch_full_score_kernel(
             }
         }
     }
-    atomicAdd(&out[(size_t)pose * 2], (double)elec);
-    atomicAdd(&out[(size_t)pose * 2 + 1], (double)vdw);
+        s_elec[threadIdx.x] = elec;
+        s_vdw[threadIdx.x]  = vdw;
+    } // end per-atom branch (out-of-range threads already stored 0 above)
+    __syncthreads();
+    // Block-tree reduction over elec then vdw (stride halving).
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_elec[threadIdx.x] += s_elec[threadIdx.x + s];
+            s_vdw[threadIdx.x]  += s_vdw[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&out[(size_t)pose * 2], (double)s_elec[0]);
+        atomicAdd(&out[(size_t)pose * 2 + 1], (double)s_vdw[0]);
+    }
 }
 
 extern "C" int cuda_batch_score(
@@ -351,7 +380,7 @@ extern "C" int cuda_batch_score(
         int threads = 256;
         int bx = (nl + threads - 1) / threads;
         dim3 grid(bx, N);
-        batch_full_score_kernel<<<grid, threads>>>(
+        batch_full_score_kernel<<<grid, threads, (size_t)2 * threads * sizeof(float)>>>(
             d_phi,nx,ny,nz,ox,oy,oz,sp,
             d_rc,d_re,d_rsv,d_rv,d_rh,d_cs,d_ca,ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
             d_lb,d_ps,d_le,d_lsv,d_lv,d_lh,nl,N,d_out);
