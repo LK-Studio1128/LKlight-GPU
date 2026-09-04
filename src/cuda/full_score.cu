@@ -10,6 +10,7 @@
 // by the host (CPU grid path) when needed.
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <stdint.h>   // uintptr_t (persistent buffer-cache keys)
 
 #define NEAR2  100.0f        // 10 A squared (near cutoff)
 #define LJ_CAP 1.0f
@@ -325,6 +326,26 @@ __global__ void batch_full_score_kernel(
     }
 }
 
+// ── persistent device-buffer cache ──────────────────────────────────────────
+// OPT (2026-09-05): over a GSO run, `cuda_batch_score` is called once per step
+// with the SAME receptor far-field grid + receptor cell list + ligand reference
+// (the host holds them in stable OnceLock buffers). Previously every call
+// cudaMalloc'd and cudaMemcpy'd all of phi/receptor/cells/ligand base from host
+// to device (~tens-to-hundreds of MB at 0.5 A for large receptors) and freed
+// them after — repeated ~once per step × 1000 steps. Now the constant device
+// arrays are cached and only (re)uploaded when the host buffers' identity
+// changes (the ptr key below). Per step we upload only the small N×7 pose
+// double buffer and download the N×2 out buffer, cutting per-step PCIe traffic
+// to a tiny fraction. Process exits free device memory via cudaDeviceReset (OS
+// reclaim) — acceptable for the CLI/docking-process model.
+typedef struct { int live; float* phi; float* rc; float* re; float* rsv;
+                 float* rv; unsigned char* rh; int* cs; int* ca;
+                 float* lb; float* le; float* lsv; float* lv; unsigned char* lh;
+                 double* out;
+                 unsigned long long key_phi, key_rc, key_cs, key_lb, key_nl;
+                 int n_phi, n_rc, n_cs, n_lb, n_l; } BatchCache;
+static BatchCache g_bc = {0};
+
 extern "C" int cuda_batch_score(
     const float* phi, int nx, int ny, int nz,
     float ox, float oy, float oz, float sp,
@@ -339,64 +360,86 @@ extern "C" int cuda_batch_score(
     double* out)
 {
     cudaError_t err;
-    float *d_phi=0,*d_rc=0,*d_re=0,*d_rsv=0,*d_rv=0; unsigned char *d_rh=0;
-    int *d_cs=0,*d_ca=0;
-    float *d_lb=0,*d_le=0,*d_lsv=0,*d_lv=0; unsigned char *d_lh=0;
-    double *d_ps=0,*d_out=0;
+    double *d_ps=0;
     size_t phi_b=(size_t)nx*ny*nz*sizeof(float);
     size_t cb=(size_t)((ncx+1)*(ncy+1)*(ncz+1))*sizeof(int);
+    // host-buffer identity key for the constant (receptor + ligand-base) arrays
+    unsigned long long k_phi = (unsigned long long)(uintptr_t)phi;
+    unsigned long long k_rc  = (unsigned long long)(uintptr_t)r_coords;
+    unsigned long long k_cs  = (unsigned long long)(uintptr_t)cell_start;
+    unsigned long long k_lb  = (unsigned long long)(uintptr_t)l_base;
+    int nl_k = nl;
+    int fresh = !(g_bc.live &&
+                  g_bc.key_phi==k_phi && g_bc.key_rc==k_rc && g_bc.key_cs==k_cs &&
+                  g_bc.key_lb==k_lb && g_bc.n_l==nl_k);
+
+    if (fresh) {
+        // release any previous receptor's cached buffers
+        if (g_bc.live) {
+            cudaFree(g_bc.phi);cudaFree(g_bc.rc);cudaFree(g_bc.re);cudaFree(g_bc.rsv);
+            cudaFree(g_bc.rv);cudaFree(g_bc.rh);cudaFree(g_bc.cs);cudaFree(g_bc.ca);
+            cudaFree(g_bc.lb);cudaFree(g_bc.le);cudaFree(g_bc.lsv);cudaFree(g_bc.lv);
+            cudaFree(g_bc.lh);cudaFree(g_bc.out);
+            memset(&g_bc,0,sizeof(g_bc));
+        }
 #define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
-    CK(cudaMalloc(&d_phi,phi_b));
-    CK(cudaMalloc(&d_rc,(size_t)nr*3*sizeof(float)));
-    CK(cudaMalloc(&d_re,(size_t)nr*sizeof(float)));
-    CK(cudaMalloc(&d_rsv,(size_t)nr*sizeof(float)));
-    CK(cudaMalloc(&d_rv,(size_t)nr*sizeof(float)));
-    CK(cudaMalloc(&d_rh,(size_t)nr));
-    CK(cudaMalloc(&d_cs,cb));
-    CK(cudaMalloc(&d_ca,(size_t)nr*sizeof(int)));
-    CK(cudaMalloc(&d_lb,(size_t)nl*3*sizeof(float)));
-    CK(cudaMalloc(&d_ps,(size_t)N*7*sizeof(double)));
-    CK(cudaMalloc(&d_le,(size_t)nl*sizeof(float)));
-    CK(cudaMalloc(&d_lsv,(size_t)nl*sizeof(float)));
-    CK(cudaMalloc(&d_lv,(size_t)nl*sizeof(float)));
-    CK(cudaMalloc(&d_lh,(size_t)nl));
-    CK(cudaMalloc(&d_out,(size_t)N*2*sizeof(double)));
-    CK(cudaMemcpy(d_phi,phi,phi_b,cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_rc,r_coords,(size_t)nr*3*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_re,r_ele,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_rsv,r_svdw,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_rv,r_vdwr,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_rh,r_heavy,(size_t)nr,cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_cs,cell_start,cb,cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_ca,cell_atoms,(size_t)nr*sizeof(int),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_lb,l_base,(size_t)nl*3*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_le,l_ele,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_lsv,l_svdw,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_lv,l_vdwr,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_lh,l_heavy,(size_t)nl,cudaMemcpyHostToDevice));
-    CK(cudaMemset(d_out,0,(size_t)N*2*sizeof(double)));
+        CK(cudaMalloc(&g_bc.phi,phi_b));
+        CK(cudaMalloc(&g_bc.rc,(size_t)nr*3*sizeof(float)));
+        CK(cudaMalloc(&g_bc.re,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&g_bc.rsv,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&g_bc.rv,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&g_bc.rh,(size_t)nr));
+        CK(cudaMalloc(&g_bc.cs,cb));
+        CK(cudaMalloc(&g_bc.ca,(size_t)nr*sizeof(int)));
+        CK(cudaMalloc(&g_bc.lb,(size_t)nl*3*sizeof(float)));
+        CK(cudaMalloc(&g_bc.le,(size_t)nl*sizeof(float)));
+        CK(cudaMalloc(&g_bc.lsv,(size_t)nl*sizeof(float)));
+        CK(cudaMalloc(&g_bc.lv,(size_t)nl*sizeof(float)));
+        CK(cudaMalloc(&g_bc.lh,(size_t)nl));
+        CK(cudaMalloc(&g_bc.out,(size_t)((nl>N?nl:N))*2*sizeof(double)));
+        CK(cudaMemcpy(g_bc.phi,phi,phi_b,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.rc,r_coords,(size_t)nr*3*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.re,r_ele,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.rsv,r_svdw,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.rv,r_vdwr,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.rh,r_heavy,(size_t)nr,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.cs,cell_start,cb,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.ca,cell_atoms,(size_t)nr*sizeof(int),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.lb,l_base,(size_t)nl*3*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.le,l_ele,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.lsv,l_svdw,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.lv,l_vdwr,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(g_bc.lh,l_heavy,(size_t)nl,cudaMemcpyHostToDevice));
+        g_bc.key_phi=k_phi; g_bc.key_rc=k_rc; g_bc.key_cs=k_cs;
+        g_bc.key_lb=k_lb;   g_bc.n_l=nl_k;    g_bc.live=1;
+#undef CK
+    }
+
+    // per-step: upload only the small N×7 pose buffer, zero out, launch, readback.
+    err = cudaMalloc(&d_ps,(size_t)N*7*sizeof(double));
+    if (err != cudaSuccess) goto fail;
+    err = cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
+    err = cudaMemset(g_bc.out,0,(size_t)N*2*sizeof(double));
+    if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
     {
         int threads = 256;
         int bx = (nl + threads - 1) / threads;
         dim3 grid(bx, N);
         batch_full_score_kernel<<<grid, threads, (size_t)2 * threads * sizeof(float)>>>(
-            d_phi,nx,ny,nz,ox,oy,oz,sp,
-            d_rc,d_re,d_rsv,d_rv,d_rh,d_cs,d_ca,ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
-            d_lb,d_ps,d_le,d_lsv,d_lv,d_lh,nl,N,d_out);
-        CK(cudaDeviceSynchronize());
+            g_bc.phi,nx,ny,nz,ox,oy,oz,sp,
+            g_bc.rc,g_bc.re,g_bc.rsv,g_bc.rv,g_bc.rh,g_bc.cs,g_bc.ca,
+            ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
+            g_bc.lb,d_ps,g_bc.le,g_bc.lsv,g_bc.lv,g_bc.lh,nl,N,g_bc.out);
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
     }
-    CK(cudaMemcpy(out,d_out,(size_t)N*2*sizeof(double),cudaMemcpyDeviceToHost));
-    cudaFree(d_phi);cudaFree(d_rc);cudaFree(d_re);cudaFree(d_rsv);cudaFree(d_rv);cudaFree(d_rh);
-    cudaFree(d_cs);cudaFree(d_ca);cudaFree(d_lb);cudaFree(d_ps);cudaFree(d_le);cudaFree(d_lsv);cudaFree(d_lv);cudaFree(d_lh);
-    cudaFree(d_out);
+    err = cudaMemcpy(out,g_bc.out,(size_t)N*2*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(d_ps);
+    if (err != cudaSuccess) goto fail;
     return 0;
 fail:
     { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_batch_score error: %s\n",m); }
-    if(d_phi)cudaFree(d_phi);if(d_rc)cudaFree(d_rc);if(d_re)cudaFree(d_re);if(d_rsv)cudaFree(d_rsv);
-    if(d_rv)cudaFree(d_rv);if(d_rh)cudaFree(d_rh);if(d_cs)cudaFree(d_cs);if(d_ca)cudaFree(d_ca);
-    if(d_lb)cudaFree(d_lb);if(d_ps)cudaFree(d_ps);if(d_le)cudaFree(d_le);if(d_lsv)cudaFree(d_lsv);if(d_lv)cudaFree(d_lv);
-    if(d_lh)cudaFree(d_lh);if(d_out)cudaFree(d_out);
+    if (d_ps) cudaFree(d_ps);
     return -1;
-#undef CK
 }
