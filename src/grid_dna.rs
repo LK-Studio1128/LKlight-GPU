@@ -13,7 +13,7 @@
 //!                   (max |q|≈0.9 ⇒ 0.54/100 = 0.0054), so the ±0.012 clamp can
 //!                   never trigger → the interaction is *linear* in the charges
 //!                   and factorises into a receptor field φ(x)=Σ_i q_i/d² sampled
-//!                   on a 1 Å grid, looked up by trilinear interpolation.
+//!                   on a grid, looked up by trilinear interpolation.
 //!
 //!   * Energy of one pose = Σ_{near pairs} exact + Σ_{lig atoms j} q_j·φ(x_j).
 //!
@@ -67,10 +67,33 @@ impl ReceptorField {
         let spread = ((FIELD_RMAX / s).ceil() as i64) + 2;
 
         // Ring-shell scatter: for each charged receptor atom, add q/d² to every grid
-        // point between 10 and 30 Å away. Complexity ≈ N_rec × (60/s)³ point tests,
-        // done once per setup (~1-3 s for a 5k-atom receptor).
-        let r2min = FIELD_RMIN * FIELD_RMIN;
-        let r2max = FIELD_RMAX * FIELD_RMAX;
+        // point between 10 and 30 Å away.
+        //
+        // OPT (2026-09-05): the per-atom window is the shell band (FIELD_RMIN,
+        // FIELD_RMAX]. A brute box scan visits every point of a (2·spread)³ box and
+        // *rejects* most of it (deep interior r<10 plus far corners r>30). We prune
+        // the axis sweeps before applying the exact distance test:
+        //
+        //   * (y,z) rows with dyz² ≥ r2max can never reach the shell on x → skipped.
+        //   * per surviving (y,z) row, dx² is a monotone function of the x grid index,
+        //     so the only x indices that can possibly lie in (rmin,rmax] have
+        //     |dx| ≤ sqrt(r2max − dyz²). We sweep exactly that contiguous x slab
+        //     (grown by a ±1 safety margin and clamped to the box) instead of the
+        //     whole ±FIELD_RMAX width, and still apply the *identical* exact test
+        //     `r2min < d2 <= r2max` to decide every write.
+        //
+        // This preserves the write set and the write order bit-for-bit: every cell
+        // still receives the same q/d² additions in the same per-atom order (each
+        // (cell,atom) pair is written at most once), so the f32 accumulator in `phi`
+        // is unchanged. The win is a large reduction of rejected distance tests —
+        // at 0.5 Å spacing this claws back much of the ~8× setup cost 0.5 Å adds
+        // over 1 Å, at zero accuracy cost.
+        let r2min = FIELD_RMIN * FIELD_RMIN;   // 100
+        let r2max = FIELD_RMAX * FIELD_RMAX;   // 900
+        let nx = n[0] as i64;
+        let ny = n[1] as i64;
+        // Grid coordinate of the atom centre along x for the per-row slab bounds.
+        let cxi = |c0: f64| (c0 - lo[0]) / s; // continuous grid x of atom centre
         for (c, &q) in coords.iter().zip(charges.iter()) {
             if q == 0.0 {
                 continue;
@@ -81,20 +104,37 @@ impl ReceptorField {
                 (((c[2] - lo[2]) / s).floor() as i64 - spread).max(0) as usize,
             ];
             let gh = [
-                (((c[0] - lo[0]) / s).floor() as i64 + spread).min(n[0] as i64 - 1) as usize,
-                (((c[1] - lo[1]) / s).floor() as i64 + spread).min(n[1] as i64 - 1) as usize,
+                (((c[0] - lo[0]) / s).floor() as i64 + spread).min(nx - 1) as usize,
+                (((c[1] - lo[1]) / s).floor() as i64 + spread).min(ny - 1) as usize,
                 (((c[2] - lo[2]) / s).floor() as i64 + spread).min(n[2] as i64 - 1) as usize,
             ];
-            let nx = n[0] as i64;
-            let ny = n[1] as i64;
+            let cxi_f = cxi(c[0]);
             for iz in gi[2]..=gh[2] {
-                let dz = lo[2] + iz as f64 * s - c[2];
+                let zz = lo[2] + iz as f64 * s;
+                let dz = zz - c[2];
                 for iy in gi[1]..=gh[1] {
-                    let dy = lo[1] + iy as f64 * s - c[1];
+                    let yy = lo[1] + iy as f64 * s;
+                    let dy = yy - c[1];
                     let dyz2 = dy * dy + dz * dz;
+                    // Far-corner pruning: even at dx=0 this row is beyond rmax.
+                    if dyz2 >= r2max {
+                        continue;
+                    }
+                    // Tight x slab: indices whose dx ∈ [-b, b], b = sqrt(r2max-dyz²).
+                    // dx = lo0 + ix·s − c0 is monotone increasing in ix, so these
+                    // form one contiguous ix range around the atom-centre grid coord.
+                    let b = (r2max - dyz2).sqrt();
+                    let mut xl = ((cxi_f - b / s).floor() as i64 - 1).max(gi[0] as i64) as usize;
+                    let mut xh = ((cxi_f + b / s).ceil() as i64 + 1).min(gh[0] as i64) as usize;
+                    // bounds must stay within [gi,gh] AND valid ascending
+                    if xl > gh[0] || xh < gi[0] {
+                        continue;
+                    }
+                    xl = xl.max(gi[0]);
+                    xh = xh.min(gh[0]);
                     let base = (iz as i64 * ny + iy as i64) * nx;
-                    let mut ix = gi[0];
-                    while ix <= gh[0] {
+                    let mut ix = xl;
+                    while ix <= xh {
                         let dx = lo[0] + ix as f64 * s - c[0];
                         let d2 = dx * dx + dyz2;
                         if d2 > r2min && d2 <= r2max {
