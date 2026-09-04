@@ -26,7 +26,9 @@ pub const CLOSE_DIST: f64 = 10.0;      // below this: exact per-pair evaluation
 pub const CLOSE_DIST2: f64 = CLOSE_DIST * CLOSE_DIST;
 pub const FIELD_RMAX: f64 = 30.0;      // electrostatics cutoff (matches ELEC_DIST_CUTOFF)
 pub const FIELD_RMIN: f64 = CLOSE_DIST; // field excludes the exact-evaluated interior
-pub const SPACING: f64 = 1.0;          // grid resolution (Å)
+pub const SPACING: f64 = 0.5;          // grid resolution (Å); 0.5 Å chosen for near-reference
+                                       // far-field accuracy (AutoDock-class 0.375–0.5 Å band). 1 Å
+                                       // roughly doubles the far-field absolute error.
 
 /// Receptor electrostatic field φ(x) = Σ_{i: 10<|x-r_i|≤30} q_i / |x-r_i|².
 #[derive(Clone)]
@@ -59,6 +61,10 @@ impl ReceptorField {
         ];
         let mut phi = vec![0.0f32; n[0] * n[1] * n[2]];
         let s = SPACING;
+        // Scatter-window half-width in grid units covering the whole ±FIELD_RMAX shell.
+        // Derived from spacing so it stays correct at any resolution (a hardcoded ±32
+        // assumed 1 Å and silently truncated the far field at finer spacing).
+        let spread = ((FIELD_RMAX / s).ceil() as i64) + 2;
 
         // Ring-shell scatter: for each charged receptor atom, add q/d² to every grid
         // point between 10 and 30 Å away. Complexity ≈ N_rec × (60/s)³ point tests,
@@ -70,14 +76,14 @@ impl ReceptorField {
                 continue;
             }
             let gi = [
-                (((c[0] - lo[0]) / s).floor() as i64 - 32).max(0) as usize,
-                (((c[1] - lo[1]) / s).floor() as i64 - 32).max(0) as usize,
-                (((c[2] - lo[2]) / s).floor() as i64 - 32).max(0) as usize,
+                (((c[0] - lo[0]) / s).floor() as i64 - spread).max(0) as usize,
+                (((c[1] - lo[1]) / s).floor() as i64 - spread).max(0) as usize,
+                (((c[2] - lo[2]) / s).floor() as i64 - spread).max(0) as usize,
             ];
             let gh = [
-                (((c[0] - lo[0]) / s).floor() as i64 + 32).min(n[0] as i64 - 1) as usize,
-                (((c[1] - lo[1]) / s).floor() as i64 + 32).min(n[1] as i64 - 1) as usize,
-                (((c[2] - lo[2]) / s).floor() as i64 + 32).min(n[2] as i64 - 1) as usize,
+                (((c[0] - lo[0]) / s).floor() as i64 + spread).min(n[0] as i64 - 1) as usize,
+                (((c[1] - lo[1]) / s).floor() as i64 + spread).min(n[1] as i64 - 1) as usize,
+                (((c[2] - lo[2]) / s).floor() as i64 + spread).min(n[2] as i64 - 1) as usize,
             ];
             let nx = n[0] as i64;
             let ny = n[1] as i64;
