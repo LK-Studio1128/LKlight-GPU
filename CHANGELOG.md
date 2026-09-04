@@ -8,6 +8,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.0] — 2026-09-05
+
+### Added: Far-field grid at 0.5 Å reference resolution (default)
+
+- The host-side far-field potential grid (`src/grid_dna.rs`, byte-identical
+  with LKlight-grid) is now built at **0.5 Å spacing** instead of 1.0 Å,
+  with the box half-width derived as `spread = ceil(FIELD_RMAX/spacing) + 2`
+  rather than a hard-coded ±32 cells. Because the CUDA far-field kernels are
+  fully parameterised by the grid (spacing / origin / nx,ny,nz / phi) with no
+  `SPACING` assumption baked into the device code, the GPU engine shares the
+  0.5 Å accuracy gain with no kernel change. Verified on real hardware
+  (Linux RTX 3080 Ti / Windows RTX 5090): worst-case per-pose absolute
+  deviation vs. the reference LKlight engine drops ~9.60 → 6.94 (~1.4×);
+  `pydock`/`cpydock` GPU == CPU bit-identical, `dna` differs only by the
+  expected f32 near-field batch rounding (≤ ~6×10⁻⁴).
+
+### Changed: CUDA batch scoring performance (device side)
+
+- **Per-block shared-memory reduction of pose atomics** (`full_score.cu`):
+  each thread block now reduces its per-atom electrostatic/VDW contributions
+  into `extern __shared__ float sm[]` and does one `atomicAdd` per block via
+  a single thread (stride-halving tree reduction), instead of every ligand
+  atom doing a double `atomicAdd` into the pose accumulator. Per-pose atomic
+  traffic drops from ~`nl` to ~`ceil(nl/256)`; out-of-range threads store 0
+  and still take the barrier so the reduction stays valid. GSO convergence is
+  unchanged (1AZP `dna` best −7254.95161 GPU vs −7254.95220 optimised
+  CPU-grid, Δ ≈ 5.9×10⁻⁴ within the f32 batch budget).
+
+- **Persistent device-buffer cache across scoring calls** (`full_score.cu`):
+  `cuda_batch_score` now keeps a process-static `BatchCache` that holds the
+  resident device copies of the receptor field, receptor/ligand constant
+  tables and grid parameters keyed by their host pointers + dimensions. On a
+  cache hit only the `N×7` pose translations/rotations are uploaded and the
+  `N×2` energies read back each call; switching receptor (a new pointer key)
+  frees and rebuilds the buffers. Large speedup for multi-pose / multi-step
+  GSO where the field is reused across thousands of scoring calls.
+
+### Changed: Shell-band box scan for faster grid setup (bit-identical)
+
+- Same `ReceptorField::build()` pruning as LKlight-grid (shared source):
+  skip `(y,z)` rows already outside the shell and scan only the contiguous
+  `x` run that can intersect the 10–30 Å shell (±1-cell margin). Written-cell
+  set/order and the `f32` field are unchanged, so all grid-path results are
+  bit-identical; grid build + first score 1.57 s → 1.02 s (~1.55×) at 0.5 Å.
+
+---
+
 ## [1.1.0] — 2026-08-29
 
 ### Fixed (found during multi-scenario testing, 2026-08-29)

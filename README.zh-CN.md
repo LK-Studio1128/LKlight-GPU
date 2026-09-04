@@ -1,6 +1,6 @@
 # LKlight-GPU
 
-**LKlight GPU（CUDA）版（v1.1.0）** —— 全功能分子对接引擎，**Windows 与 Linux +
+**LKlight GPU（CUDA）版（v1.2.0）** —— 全功能分子对接引擎，**Windows 与 Linux +
 NVIDIA 驱动即用**；无 GPU 时自动回退 CPU 网格路径，功能与 `../LKlight-grid` 完全等价。
 
 LKlight 是 Python LightDock（GSO 群智能对接）的 Rust 高性能实现；本目录是 **CUDA
@@ -82,5 +82,6 @@ cargo test --release                        # 34 项测试
 
 ## 六、发布信息
 
-- 版本：**v1.1.0**（2026-09-03 bug 审计修复后快照；原仓库 git `d4667c6`）
+- 版本：**v1.2.0**（远场网格 0.5 Å 参考分辨率 + GPU 逐块归约/设备缓冲复用 + 建场提速）
+  - v1.1.0：2026-09-03 bug 审计修复后快照；原仓库 git `d4667c6`
 - 二进制：静态链 cudart → `ldd` 零 CUDA 依赖（仅 ~6 个系统库）；测试 34/34。
