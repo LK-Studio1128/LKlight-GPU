@@ -360,6 +360,8 @@ extern "C" int cuda_batch_score(
     double* out)
 {
     cudaError_t err;
+    int stage = 0;   // 0=alloc-fresh 1=malloc-poses 2=copy-poses 3=memset-out 4=launch 5=sync 6=readback
+    cudaGetLastError();  // drain any stale sticky error so each step is independent
     double *d_ps=0;
     size_t phi_b=(size_t)nx*ny*nz*sizeof(float);
     size_t cb=(size_t)((ncx+1)*(ncy+1)*(ncz+1))*sizeof(int);
@@ -416,30 +418,38 @@ extern "C" int cuda_batch_score(
     }
 
     // per-step: upload only the small N×7 pose buffer, zero out, launch, readback.
+    stage = 1;
     err = cudaMalloc(&d_ps,(size_t)N*7*sizeof(double));
     if (err != cudaSuccess) goto fail;
+    stage = 2;
     err = cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
+    stage = 3;
     err = cudaMemset(g_bc.out,0,(size_t)N*2*sizeof(double));
     if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
     {
         int threads = 256;
         int bx = (nl + threads - 1) / threads;
         dim3 grid(bx, N);
+        stage = 4;
         batch_full_score_kernel<<<grid, threads, (size_t)2 * threads * sizeof(float)>>>(
             g_bc.phi,nx,ny,nz,ox,oy,oz,sp,
             g_bc.rc,g_bc.re,g_bc.rsv,g_bc.rv,g_bc.rh,g_bc.cs,g_bc.ca,
             ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
             g_bc.lb,d_ps,g_bc.le,g_bc.lsv,g_bc.lv,g_bc.lh,nl,N,g_bc.out);
-        err = cudaDeviceSynchronize();
+        err = cudaGetLastError();          // launch-config errors surface here
+        if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
+        stage = 5;
+        err = cudaDeviceSynchronize();     // kernel execution errors surface here
         if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
     }
+    stage = 6;
     err = cudaMemcpy(out,g_bc.out,(size_t)N*2*sizeof(double),cudaMemcpyDeviceToHost);
     cudaFree(d_ps);
     if (err != cudaSuccess) goto fail;
     return 0;
 fail:
-    { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_batch_score error: %s\n",m); }
+    { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_batch_score error stage=%d N=%d nl=%d err=%d(%s)\n",stage,N,nl,(int)err,m); }
     if (d_ps) cudaFree(d_ps);
     return -1;
 }

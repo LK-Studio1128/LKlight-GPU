@@ -409,6 +409,12 @@ pub struct DNA {
     pub rec_cuda: OnceLock<CudaReceptor>,
     /// Once-probed GPU availability (drives `supports_batch`).
     pub gpu_state: OnceLock<bool>,
+    #[cfg(feature = "cuda")]
+    /// Lazily-built ligand GPU parameter arrays. Cached here (not rebuilt per
+    /// call) so their host pointers are stable and the CUDA persistent-buffer
+    /// cache — keyed on pointer + nl — hits across GSO steps instead of forcing
+    /// a full device re-upload on every luciferin update.
+    pub lig_cuda: OnceLock<crate::gpu_score::CudaLigand>,
 }
 
 impl<'a> DNA {
@@ -445,6 +451,8 @@ impl<'a> DNA {
             field: OnceLock::new(),
             rec_cuda: OnceLock::new(),
             gpu_state: OnceLock::new(),
+            #[cfg(feature = "cuda")]
+            lig_cuda: OnceLock::new(),
         };
         Box::new(d)
     }

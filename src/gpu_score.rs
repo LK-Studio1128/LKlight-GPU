@@ -10,6 +10,38 @@ use crate::dna::{DNA, DNADockingModel};
 use crate::grid_dna::{ReceptorField, CLOSE_DIST};
 use crate::qt::Quaternion;
 
+/// GPU-ready ligand parameter arrays. Built once and cached on [`crate::dna::DNA`]
+/// so the host pointers stay stable across GSO steps: the CUDA persistent-buffer
+/// cache keys on the ligand-base pointer + nl, so rebuilding these Vecs per call
+/// (as the original code did) changed the base pointer every step and forced a
+/// full device re-upload (phi grid + receptor + ligand) on *every* luciferin
+/// update — the "buffer reuse" optimisation never actually hit.
+pub struct CudaLigand {
+    pub base: Vec<f32>, // nl*3 flattened reference coordinates
+    pub ele: Vec<f32>,
+    pub svdw: Vec<f32>,
+    pub vdw: Vec<f32>,
+    pub heavy: Vec<u8>,
+}
+
+impl CudaLigand {
+    pub fn build(lig: &DNADockingModel) -> CudaLigand {
+        let mut base = Vec::with_capacity(lig.coordinates.len() * 3);
+        for c in lig.coordinates.iter() {
+            base.push(c[0] as f32);
+            base.push(c[1] as f32);
+            base.push(c[2] as f32);
+        }
+        CudaLigand {
+            base,
+            ele: lig.ele_charges.iter().map(|&q| q as f32).collect(),
+            svdw: lig.sqrt_vdw_charges.iter().map(|&q| q as f32).collect(),
+            vdw: lig.vdw_radii.iter().map(|&r| r as f32).collect(),
+            heavy: lig.heavy.iter().map(|&h| h as u8).collect(),
+        }
+    }
+}
+
 /// GPU-ready receptor description: parameter arrays + 10 Å cell list (built once).
 pub struct CudaReceptor {
     pub r_coords: Vec<f32>,
@@ -232,16 +264,20 @@ pub fn batch_energy_gpu_scores(
         return None;
     }
 
-    // Upload only the reference ligand coords (once per call, ~nl*3*4 B) plus
-    // N×7 pose parameters; the kernel rotates/translates on the device in f64.
-    // Previously we CPU-transformed N*nl*3 coords (~30 MB per step at n=200) —
-    // that host-side work and memcpy is now amortised into the kernel.
-    let base: Vec<f32> = dna
-        .ligand
-        .coordinates
-        .iter()
-        .flat_map(|c| c.iter().map(|&v| v as f32))
-        .collect();
+    // Stable ligand GPU arrays cached on `dna` (OnceLock) so the CUDA persistent
+    // buffer cache — keyed on the ligand-base host pointer + nl — hits across
+    // GSO steps. NOTE: rebuilding these Vecs per call (original code) changed
+    // `base`'s pointer every step → cache key mismatch → full device re-upload
+    // of phi/receptor/cells/ligand on every luciferin update (~200 ms/step on
+    // Windows WDDM because cudaMalloc/cudaFree per step is expensive).
+    let lig = dna
+        .lig_cuda
+        .get_or_init(|| CudaLigand::build(&dna.ligand));
+    let base = &lig.base;
+    let le = &lig.ele;
+    let lsv = &lig.svdw;
+    let lv = &lig.vdw;
+    let lh = &lig.heavy;
     let mut poses: Vec<f64> = Vec::with_capacity(n_pose * 7);
     for (t, r) in translations.iter().zip(rotations.iter()) {
         poses.push(r.w);
@@ -252,10 +288,6 @@ pub fn batch_energy_gpu_scores(
         poses.push(t[1]);
         poses.push(t[2]);
     }
-    let le: Vec<f32> = dna.ligand.ele_charges.iter().map(|&q| q as f32).collect();
-    let lsv: Vec<f32> = dna.ligand.sqrt_vdw_charges.iter().map(|&q| q as f32).collect();
-    let lv: Vec<f32> = dna.ligand.vdw_radii.iter().map(|&r| r as f32).collect();
-    let lh: Vec<u8> = dna.ligand.heavy.iter().map(|&h| h as u8).collect();
     let mut out = vec![0.0f64; n_pose * 2];
 
     let ret = unsafe {
