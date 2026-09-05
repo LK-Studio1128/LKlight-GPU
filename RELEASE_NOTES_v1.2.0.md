@@ -34,6 +34,17 @@ performance optimisations + faster grid setup.**
 - **Shell-band box scan for faster grid setup (bit-identical).** Same shared
   `grid_dna.rs` pruning as LKlight-grid: written-cell set/order and the `f32`
   field are unchanged; grid build + first score 1.57 s → 1.02 s at 0.5 Å.
+- **Ligand C-cache pointer stabilisation (performance + robustness fix).**
+  `batch_energy_gpu_scores` rebuilt the ligand parameter vectors on every call,
+  so the C-side batch-cache key (base-pointer) never matched and every step did
+  a full rebuild (repeated `cudaMalloc`/`cudaFree` + full 0.5 Å field upload).
+  Ligand arrays are now cached once per system (`DNA.lig_cuda`, `OnceLock`,
+  `cfg(cuda)`) with stable pointers, so the persistent device cache actually
+  hits step-to-step. Also clears any sticky CUDA error at the batch entry so a
+  single failed step can no longer poison later launches, and reports numeric
+  error codes in diagnostics. Measured on Windows RTX 5090, 1000 glowworms ×
+  1000 steps, 1AZP `dna`: GPU wall-clock **267.6 s → 4.05 s (~66×)**, batch
+  errors → 0, best energy unchanged (−7254.9516108, bit-identical).
 
 ## Accuracy contract
 
@@ -44,11 +55,12 @@ performance optimisations + faster grid setup.**
 
 | Platform | File | Binary |
 |---|---|---|
-| Linux x86-64 | `LKlight-GPU-v1.2.0-linux-x86_64.tar.gz` | CUDA-enabled, musl static-PIE |
-| Windows x64 | `LKlight-GPU-v1.2.0-win-x64.zip` | CUDA-enabled, PE32+ console |
+| Linux x86-64 | `LKlight-linux-cuda` | CUDA-enabled, glibc |
+| Windows x64 | `LKlight-win64-cuda.exe` | CUDA-enabled, PE32+ console |
 
-Each archive contains the binary plus `README.md`, `LICENSE` (GPL-3.0),
-`NOTICE` and `CHANGELOG.md`.
+Static cudart: the target machine only needs the NVIDIA driver. Bare binaries
+follow the v1.1.0 asset layout; each repo tree carries `README.md`, `LICENSE`
+(GPL-3.0), `NOTICE` and `CHANGELOG.md`.
 
 ## Citation & DOI
 
