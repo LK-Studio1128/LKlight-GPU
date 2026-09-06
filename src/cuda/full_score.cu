@@ -583,7 +583,7 @@ extern "C" int cuda_cpydock_solv(
     // One static cache for the per-pose min buffers (sized to N×nr / N×nl).
     static int *dminR = 0; static float *dminL = 0;
     static int cap_nr = 0, cap_nl = 0, cap_N = 0;
-    cudaError_t err;
+    cudaError_t err; int st = 0;
 #define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
     if (N > cap_N || nr > cap_nr || nl > cap_nl) {
         if (dminR) cudaFree(dminR);
@@ -604,7 +604,7 @@ extern "C" int cuda_cpydock_solv(
             l_base, poses, l_flag, nr, nl, N, dminR, dminL);
         CK(cudaGetLastError());
     }
-    CK(cudaDeviceSynchronize());
+    CK(cudaDeviceSynchronize()); st = 1; st = 1;
     // Stage B (multi-block reduce into outS)
     CK(cudaMemset(outS, 0, (size_t)N*sizeof(double)));
     {
@@ -616,10 +616,11 @@ extern "C" int cuda_cpydock_solv(
             dminR, dminL, r_asa, r_des, l_asa, l_des, nr, nl, N, outS);
         CK(cudaGetLastError());
     }
-    CK(cudaDeviceSynchronize());
+    CK(cudaDeviceSynchronize()); st = 2;
     return 0;
 fail:
-    { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_cpydock_solv error: %s\n",m); }
+    { const char* m=cudaGetErrorString(err);
+      fprintf(stderr,"cuda_cpydock_solv error stage=%d N=%d nr=%d nl=%d: %s\n", st, N, nr, nl, m); }
     return -1;
 #undef CK
 }
