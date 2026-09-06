@@ -275,15 +275,21 @@ impl Score for VDW {
         #[cfg(feature = "cuda")]
         if !self.use_anm {
             let cached = self.gpu.get_or_init(|| {
-                crate::gpu_family::build_family(&self.receptor, &self.ligand, false)
+                Some(crate::gpu_family::build_family(
+                    &self.receptor,
+                    &self.ligand,
+                    false,
+                ))
             });
-            if let Some(scores) = crate::gpu_family::batch_cuda_family(
-                cached,
-                translations,
-                rotations,
-                crate::gpu_family::family_flags("vdw"),
-            ) {
-                return scores;
+            if let Some(g) = cached.as_ref() {
+                if let Some(scores) = crate::gpu_family::batch_cuda_family(
+                    g,
+                    translations,
+                    rotations,
+                    crate::gpu_family::family_flags("vdw"),
+                ) {
+                    return scores;
+                }
             }
         }
         translations
