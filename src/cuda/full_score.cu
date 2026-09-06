@@ -18,6 +18,12 @@
 #define CP_F   0.75f
 #define ES_CAP 0.01204819f   // 1.0*EPSILON/FACTOR with EPSILON=4, FACTOR=332
 
+// Per-family kernel flags (the LJ term is always on: every all-atom family
+// scores it). DNA = FAR|ELEC|CLASH (7), PYDOCK = FAR|ELEC (3), VDW = 0 (LJ only).
+#define F_FAR   1u
+#define F_ELEC  2u
+#define F_CLASH 4u
+
 __device__ __forceinline__ float sample_phi_f(
     const float* __restrict__ phi, int nx, int ny, int nz,
     float ox, float oy, float oz, float sp,
@@ -225,6 +231,7 @@ __global__ void batch_full_score_kernel(
     const float* __restrict__ l_ele, const float* __restrict__ l_svdw,
     const float* __restrict__ l_vdwr, const unsigned char* __restrict__ l_heavy,
     int nl, int N,
+    unsigned flags,
     double* __restrict__ out)                 // N * 2  (elec, vdw)
 {
     int pose = blockIdx.y;
@@ -264,7 +271,7 @@ __global__ void batch_full_score_kernel(
     float vdwrj = l_vdwr[j];
     bool hj = l_heavy[j] != 0;
     float elec = 0.f, vdw = 0.f;
-    if (qj != 0.f)
+    if ((flags & F_FAR) && qj != 0.f)
         elec += qj * sample_phi_f(phi, nx, ny, nz, ox, oy, oz, sp, x, y, z);
     int cxi = (int)floorf((x - c_ox) / c_sp);
     int cyi = (int)floorf((y - c_oy) / c_sp);
@@ -287,17 +294,19 @@ __global__ void batch_full_score_kernel(
                     float dzf = z - r_coords[i*3+2];
                     float d2 = dxf*dxf + dyf*dyf + dzf*dzf;
                     if (d2 <= NEAR2) {
-                        float ae = qj * r_ele[i] / d2;
-                        if (ae > ES_CAP) ae = ES_CAP;
-                        else if (ae < -ES_CAP) ae = -ES_CAP;
-                        elec += ae;
+                        if (flags & F_ELEC) {
+                            float ae = qj * r_ele[i] / d2;
+                            if (ae > ES_CAP) ae = ES_CAP;
+                            else if (ae < -ES_CAP) ae = -ES_CAP;
+                            elec += ae;
+                        }
                         float sv = svdwj * r_svdw[i];
                         float rr = vdwrj + r_vdwr[i];
                         float rr2 = rr * rr;
                         float p6 = rr2 * rr2 * rr2 / (d2 * d2 * d2);
                         float vp = sv * (p6*p6 - 2.0f*p6);
                         if (vp > LJ_CAP) vp = LJ_CAP;
-                        if (hj && r_heavy[i]) {
+                        if ((flags & F_CLASH) && hj && r_heavy[i]) {
                             float d = sqrtf(d2);
                             float dmin = CP_F * rr;
                             if (d < dmin) vp += CP_W * (dmin - d);
@@ -343,6 +352,7 @@ typedef struct { int live; float* phi; float* rc; float* re; float* rsv;
                  float* lb; float* le; float* lsv; float* lv; unsigned char* lh;
                  double* out;
                  unsigned long long key_phi, key_rc, key_cs, key_lb, key_nl;
+                 unsigned flags;
                  int n_phi, n_rc, n_cs, n_lb, n_l; } BatchCache;
 static BatchCache g_bc = {0};
 
@@ -357,6 +367,7 @@ extern "C" int cuda_batch_score(
     const float* l_base, const double* poses, const float* l_ele,
     const float* l_svdw, const float* l_vdwr, const unsigned char* l_heavy,
     int nl, int N,
+    unsigned flags,
     double* out)
 {
     cudaError_t err;
@@ -373,7 +384,7 @@ extern "C" int cuda_batch_score(
     int nl_k = nl;
     int fresh = !(g_bc.live &&
                   g_bc.key_phi==k_phi && g_bc.key_rc==k_rc && g_bc.key_cs==k_cs &&
-                  g_bc.key_lb==k_lb && g_bc.n_l==nl_k);
+                  g_bc.key_lb==k_lb && g_bc.n_l==nl_k && g_bc.flags==flags);
 
     if (fresh) {
         // release any previous receptor's cached buffers
@@ -413,7 +424,7 @@ extern "C" int cuda_batch_score(
         CK(cudaMemcpy(g_bc.lv,l_vdwr,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
         CK(cudaMemcpy(g_bc.lh,l_heavy,(size_t)nl,cudaMemcpyHostToDevice));
         g_bc.key_phi=k_phi; g_bc.key_rc=k_rc; g_bc.key_cs=k_cs;
-        g_bc.key_lb=k_lb;   g_bc.n_l=nl_k;    g_bc.live=1;
+        g_bc.key_lb=k_lb;   g_bc.n_l=nl_k;    g_bc.flags=flags; g_bc.live=1;
 #undef CK
     }
 
@@ -436,7 +447,7 @@ extern "C" int cuda_batch_score(
             g_bc.phi,nx,ny,nz,ox,oy,oz,sp,
             g_bc.rc,g_bc.re,g_bc.rsv,g_bc.rv,g_bc.rh,g_bc.cs,g_bc.ca,
             ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
-            g_bc.lb,d_ps,g_bc.le,g_bc.lsv,g_bc.lv,g_bc.lh,nl,N,g_bc.out);
+            g_bc.lb,d_ps,g_bc.le,g_bc.lsv,g_bc.lv,g_bc.lh,nl,N,flags,g_bc.out);
         err = cudaGetLastError();          // launch-config errors surface here
         if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
         stage = 5;
