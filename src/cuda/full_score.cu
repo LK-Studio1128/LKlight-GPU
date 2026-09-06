@@ -590,12 +590,16 @@ extern "C" int cuda_cpydock_solv(
         if (dminR) cudaFree(dminR);
         if (dminL) cudaFree(dminL);
         if (d_out) cudaFree(d_out);
+        st = 10;
         CK(cudaMalloc(&dminR,(size_t)N*nr*sizeof(int)));
+        st = 11;
         CK(cudaMalloc(&dminL,(size_t)N*nl*sizeof(float)));
+        st = 12;
         CK(cudaMalloc(&d_out,(size_t)N*sizeof(double)));
         cap_nr=nr; cap_nl=nl; cap_N=N;
     }
     // Stage A
+    st = 13;
     CK(cudaMemset(dminR, 0x7F, (size_t)N*nr*sizeof(int)));   // +inf bits
     {
         int threads = 256;
@@ -605,8 +609,10 @@ extern "C" int cuda_cpydock_solv(
             r_coords, r_flag, cell_start, cell_atoms,
             ncx, ncy, ncz, c_ox, c_oy, c_oz, c_sp,
             l_base, poses, l_flag, nr, nl, N, dminR, dminL);
+        st = 14;
         CK(cudaGetLastError());
     }
+    st = 15;
     CK(cudaDeviceSynchronize()); st = 1; st = 1;
     // Stage B (multi-block reduce into outS)
     CK(cudaMemset(d_out, 0, (size_t)N*sizeof(double)));
