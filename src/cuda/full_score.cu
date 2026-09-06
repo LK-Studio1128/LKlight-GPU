@@ -582,14 +582,17 @@ extern "C" int cuda_cpydock_solv(
 {
     // One static cache for the per-pose min buffers (sized to N×nr / N×nl).
     static int *dminR = 0; static float *dminL = 0;
+    static double *d_out = 0;
     static int cap_nr = 0, cap_nl = 0, cap_N = 0;
     cudaError_t err; int st = 0;
 #define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
     if (N > cap_N || nr > cap_nr || nl > cap_nl) {
         if (dminR) cudaFree(dminR);
         if (dminL) cudaFree(dminL);
+        if (d_out) cudaFree(d_out);
         CK(cudaMalloc(&dminR,(size_t)N*nr*sizeof(int)));
         CK(cudaMalloc(&dminL,(size_t)N*nl*sizeof(float)));
+        CK(cudaMalloc(&d_out,(size_t)N*sizeof(double)));
         cap_nr=nr; cap_nl=nl; cap_N=N;
     }
     // Stage A
@@ -606,17 +609,18 @@ extern "C" int cuda_cpydock_solv(
     }
     CK(cudaDeviceSynchronize()); st = 1; st = 1;
     // Stage B (multi-block reduce into outS)
-    CK(cudaMemset(outS, 0, (size_t)N*sizeof(double)));
+    CK(cudaMemset(d_out, 0, (size_t)N*sizeof(double)));
     {
         int threads = 256;
         int bx = (nr + nl + threads - 1) / threads;
         if (bx < 8) bx = 8; if (bx > 64) bx = 64;
         dim3 grid(bx, N);
         cpydock_solv_kernel<<<grid, threads, threads*sizeof(float)>>>(
-            dminR, dminL, r_asa, r_des, l_asa, l_des, nr, nl, N, outS);
+            dminR, dminL, r_asa, r_des, l_asa, l_des, nr, nl, N, d_out);
         CK(cudaGetLastError());
     }
     CK(cudaDeviceSynchronize()); st = 2;
+    CK(cudaMemcpy(outS, d_out, (size_t)N*sizeof(double), cudaMemcpyDeviceToHost));
     return 0;
 fail:
     { const char* m=cudaGetErrorString(err);
