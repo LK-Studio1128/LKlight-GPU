@@ -63,6 +63,21 @@ pub trait Score: Send + Sync {
             .map(|(t, r)| self.energy(t, r, &[], &[]))
             .collect()
     }
+
+    /// [Metal POC] Export a deterministic N-pose scoring dataset + CPU baseline
+    /// for an external Metal kernel (see `DNA::dump_metal_dataset`). Default:
+    /// unsupported → error.
+    fn dump_metal_dataset(
+        &self,
+        _n_pose: usize,
+        _seed: u64,
+        _dir: &std::path::Path,
+    ) -> std::io::Result<(f64, f64)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "dump_metal_dataset not supported by this scoring engine",
+        ))
+    }
 }
 
 pub fn satisfied_restraints(interface: &[usize], restraints: &HashMap<String, Vec<usize>>) -> f64 {

@@ -1,6 +1,6 @@
 [package]
 name = "lklight"
-version = "1.2.0"
+version = "1.2.1"
 authors = ["LKlight Contributors"]
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -28,9 +28,14 @@ env_logger = "0.11.3"
 name = "LKlight"
 path = "src/bin/lightdock.rs"
 
+[[bin]]
+name = "poc_dump"
+path = "src/bin/poc_dump.rs"
+
 [features]
 default = []
 cuda = []
+metal = []
 
 [lints.clippy]
 borrowed_box = "allow"

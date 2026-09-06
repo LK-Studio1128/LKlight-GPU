@@ -15,6 +15,46 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda/full_score.cu");
     println!("cargo:rerun-if-changed=build.rs");
 
+    if std::env::var("CARGO_FEATURE_METAL").is_ok() {
+        // Apple GPU: compile the Metal batch-scorer shim (ObjC + embedded MSL)
+        // into a static lib with clang, then link Metal/Foundation frameworks.
+        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if os != "macos" {
+            panic!("the `metal` feature requires macOS (Apple GPU); this build target is {os}");
+        }
+        println!("cargo:rerun-if-changed=src/metal/lk_metal.m");
+        let clang = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let obj = out_dir.join("lk_metal.o");
+        let status = Command::new(&clang)
+            .args(["-O2", "-fobjc-arc", "-fno-common", "-fno-lto", "-c"])
+            .arg("src/metal/lk_metal.m")
+            .arg("-o")
+            .arg(&obj)
+            .status()
+            .expect("failed to spawn clang for src/metal/lk_metal.m");
+        if !status.success() {
+            panic!("clang failed to compile src/metal/lk_metal.m (status {status})");
+        }
+        let lib = out_dir.join("liblkmetal.a");
+        let status = Command::new("ar")
+            .args(["crs"])
+            .arg(&lib)
+            .arg(&obj)
+            .status()
+            .expect("failed to run ar");
+        if !status.success() {
+            panic!("ar failed (status {status})");
+        }
+        println!("cargo:rustc-link-search=native={}", out_dir.display());
+        println!("cargo:rustc-link-lib=static=lkmetal");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=objc");
+        return;
+    }
+
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
         // Plain CPU build — nothing to do.
         return;

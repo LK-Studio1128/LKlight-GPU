@@ -41,6 +41,12 @@ const VDW_DIST_CUTOFF2: f64 = VDW_DIST_CUTOFF * VDW_DIST_CUTOFF;
 const ELEC_MAX_CUTOFF: f64 = MAX_ES_CUTOFF * EPSILON / FACTOR;
 const ELEC_MIN_CUTOFF: f64 = MIN_ES_CUTOFF * EPSILON / FACTOR;
 
+// Binary-emit helpers for `dump_metal_dataset`. The byte buffer is an explicit
+// argument (macro hygiene resolves `$b` at the call site).
+macro_rules! w_i32 { ($b:expr, $v:expr) => { $b.extend_from_slice(&(($v) as i32).to_le_bytes()); } }
+macro_rules! w_f32 { ($b:expr, $v:expr) => { $b.extend_from_slice(&(($v) as f32).to_le_bytes()); } }
+macro_rules! w_f64 { ($b:expr, $v:expr) => { $b.extend_from_slice(&(($v) as f64).to_le_bytes()); } }
+
 pub fn atoms_in_residues(residue_name: &str) -> &'static [&'static str] {
     match residue_name {
         "ALA" => &["N", "CA", "C", "O", "CB"],
@@ -415,6 +421,10 @@ pub struct DNA {
     /// cache — keyed on pointer + nl — hits across GSO steps instead of forcing
     /// a full device re-upload on every luciferin update.
     pub lig_cuda: OnceLock<crate::gpu_score::CudaLigand>,
+    #[cfg(feature = "metal")]
+    /// Lazily-built Apple-GPU (Metal) scoring context (device/pipeline/buffers).
+    /// `None` means the GPU was unavailable at first use; the run stays on CPU.
+    pub lig_metal: OnceLock<Option<crate::metal_score::MetalCtx>>,
 }
 
 impl<'a> DNA {
@@ -453,12 +463,205 @@ impl<'a> DNA {
             gpu_state: OnceLock::new(),
             #[cfg(feature = "cuda")]
             lig_cuda: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            lig_metal: OnceLock::new(),
         };
         Box::new(d)
     }
 }
 
 impl DNA {
+    /// [Metal POC] Export a deterministic N-pose batch of the DNA grid-scoring
+    /// inputs to `dir`, together with per-pose CPU-grid reference energies and
+    /// CPU-grid / CPU-exact wall-clock, so an external Metal kernel can be
+    /// validated and timed on byte-identical data. Pure Rust / no CUDA.
+    ///
+    /// Files written under `dir`:
+    ///   meta.json   – dimensions & geometry (nx,ny,nz,nr,nl,n_pose,ncx,ncy,ncz,
+    ///                 cell grid origin/spacing, cell_start length, phi length)
+    ///   field.bin   – [nx ny nz : i32][ox oy oz : f64][spacing : f64][phi f32…]
+    ///   rec.bin     – [nr : i32][coords f32 nr·3][ele f32 nr][svdw f32 nr]
+    ///                 [vdwr f32 nr][heavy u8 nr][ncx ncy ncz : i32]
+    ///                 [c_ox c_oy c_oz c_sp : f32][cell_start i32…][cell_atoms i32 nr]
+    ///   lig.bin     – [nl : i32][ele f32 nl][svdw f32 nl][vdwr f32 nl][heavy u8 nl]
+    ///   poses.bin   – [n_pose : i32][nl : i32][per-pose f64 rigid-transform coords,
+    ///                 flattened f32 n_pose·nl·3, pose-major]
+    ///   ref.bin     – [n_pose : i32][per-pose CPU-grid energy : f64]
+    ///
+    /// Returns (cpu_grid_ms, cpu_exact_ms) for the same N poses (single thread).
+    pub fn dump_metal_dataset(
+        &self,
+        n_pose: usize,
+        seed: u64,
+        dir: &std::path::Path,
+    ) -> std::io::Result<(f64, f64)> {
+        use std::time::Instant;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        std::fs::create_dir_all(dir)?;
+        let field = self.field.get_or_init(|| {
+            ReceptorField::build(&self.receptor.coordinates, &self.receptor.ele_charges)
+        });
+        let crec = self.rec_cuda.get_or_init(|| CudaReceptor::build(&self.receptor));
+
+        // -- deterministic pose set: translations in [-20,20]^3, unit quaternions
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut translations: Vec<[f64; 3]> = Vec::with_capacity(n_pose);
+        let mut rotations: Vec<Quaternion> = Vec::with_capacity(n_pose);
+        for _ in 0..n_pose {
+            let t = [
+                rng.gen::<f64>() * 40.0 - 20.0,
+                rng.gen::<f64>() * 40.0 - 20.0,
+                rng.gen::<f64>() * 40.0 - 20.0,
+            ];
+            let q = loop {
+                let q = Quaternion::new(
+                    rng.gen::<f64>() * 2.0 - 1.0,
+                    rng.gen::<f64>() * 2.0 - 1.0,
+                    rng.gen::<f64>() * 2.0 - 1.0,
+                    rng.gen::<f64>() * 2.0 - 1.0,
+                );
+                let n2 = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+                if n2 > 1e-12 {
+                    let inv = 1.0 / n2.sqrt();
+                    break Quaternion::new(q.w * inv, q.x * inv, q.y * inv, q.z * inv);
+                }
+            };
+            translations.push(t);
+            rotations.push(q);
+        }
+
+        // -- CPU baselines + reference energies (single-thread, this process)
+        let t0 = Instant::now();
+        let mut refs: Vec<f64> = Vec::with_capacity(n_pose);
+        for k in 0..n_pose {
+            refs.push(self.energy_grid(&translations[k], &rotations[k], &[], &[]));
+        }
+        let cpu_grid_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t0 = Instant::now();
+        for k in 0..n_pose {
+            let _ = self.energy_exact(&translations[k], &rotations[k], &[], &[]);
+        }
+        let cpu_exact_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // -- transformed ligand coordinates (identical f64 rigid transform)
+        let nl = self.ligand.coordinates.len();
+        let mut posebuf: Vec<f32> = Vec::with_capacity(n_pose * nl * 3);
+        for k in 0..n_pose {
+            let rot = rotations[k].to_matrix();
+            let t = &translations[k];
+            for c in self.ligand.coordinates.iter() {
+                let r = crate::qt::rot3_apply(&rot, *c);
+                posebuf.push((r[0] + t[0]) as f32);
+                posebuf.push((r[1] + t[1]) as f32);
+                posebuf.push((r[2] + t[2]) as f32);
+            }
+        }
+
+        let mut b: Vec<u8> = Vec::new();
+
+        // field.bin
+        b.clear();
+        for n in field.n.iter() {
+            w_i32!(b, *n as i32);
+        }
+        for o in field.origin.iter() {
+            w_f64!(b, *o);
+        }
+        w_f64!(b, field.spacing);
+        for x in field.phi.iter() {
+            w_f32!(b, *x);
+        }
+        std::fs::write(dir.join("field.bin"), &b)?;
+
+        // rec.bin
+        b.clear();
+        let nr = self.receptor.coordinates.len();
+        w_i32!(b, nr as i32);
+        for c in self.receptor.coordinates.iter() {
+            for a in 0..3 {
+                w_f32!(b, c[a] as f32);
+            }
+        }
+        for x in self.receptor.ele_charges.iter() {
+            w_f32!(b, *x as f32);
+        }
+        for x in self.receptor.sqrt_vdw_charges.iter() {
+            w_f32!(b, *x as f32);
+        }
+        for x in self.receptor.vdw_radii.iter() {
+            w_f32!(b, *x as f32);
+        }
+        for h in self.receptor.heavy.iter() {
+            b.push(if *h { 1u8 } else { 0u8 });
+        }
+        w_i32!(b, crec.ncx);
+        w_i32!(b, crec.ncy);
+        w_i32!(b, crec.ncz);
+        w_f32!(b, crec.c_ox);
+        w_f32!(b, crec.c_oy);
+        w_f32!(b, crec.c_oz);
+        w_f32!(b, crec.c_sp);
+        for x in crec.cell_start.iter() {
+            w_i32!(b, *x);
+        }
+        for x in crec.cell_atoms.iter() {
+            w_i32!(b, *x);
+        }
+        std::fs::write(dir.join("rec.bin"), &b)?;
+
+        // lig.bin
+        b.clear();
+        w_i32!(b, nl as i32);
+        for x in self.ligand.ele_charges.iter() {
+            w_f32!(b, *x as f32);
+        }
+        for x in self.ligand.sqrt_vdw_charges.iter() {
+            w_f32!(b, *x as f32);
+        }
+        for x in self.ligand.vdw_radii.iter() {
+            w_f32!(b, *x as f32);
+        }
+        for h in self.ligand.heavy.iter() {
+            b.push(if *h { 1u8 } else { 0u8 });
+        }
+        std::fs::write(dir.join("lig.bin"), &b)?;
+
+        // poses.bin
+        b.clear();
+        w_i32!(b, n_pose as i32);
+        w_i32!(b, nl as i32);
+        for x in posebuf.iter() {
+            w_f32!(b, *x);
+        }
+        std::fs::write(dir.join("poses.bin"), &b)?;
+
+        // ref.bin
+        b.clear();
+        w_i32!(b, n_pose as i32);
+        for x in refs.iter() {
+            w_f64!(b, *x);
+        }
+        std::fs::write(dir.join("ref.bin"), &b)?;
+
+        // meta.json
+        let meta = serde_json::json!({
+            "nx": field.n[0], "ny": field.n[1], "nz": field.n[2],
+            "ox": field.origin[0], "oy": field.origin[1], "oz": field.origin[2],
+            "spacing": field.spacing, "phi_len": field.phi.len(),
+            "nr": nr, "nl": nl, "n_pose": n_pose,
+            "ncx": crec.ncx, "ncy": crec.ncy, "ncz": crec.ncz,
+            "c_ox": crec.c_ox, "c_oy": crec.c_oy, "c_oz": crec.c_oz, "c_sp": crec.c_sp,
+            "cell_start_len": crec.cell_start.len(),
+            "cpu_grid_ms": cpu_grid_ms, "cpu_exact_ms": cpu_exact_ms,
+        });
+        std::fs::write(dir.join("meta.json"), meta.to_string())?;
+
+        Ok((cpu_grid_ms, cpu_exact_ms))
+    }
+
     /// Exact per-pair reference implementation (AMBER94 pair loop with the 1-D
     /// Z-window acceleration). Kept for numerical cross-checks against the
     /// grid-accelerated [`DNA::energy_grid`] path (see grid_dna.rs).
@@ -796,6 +999,15 @@ impl DNA {
 }
 
 impl Score for DNA {
+    fn dump_metal_dataset(
+        &self,
+        n_pose: usize,
+        seed: u64,
+        dir: &std::path::Path,
+    ) -> std::io::Result<(f64, f64)> {
+        DNA::dump_metal_dataset(self, n_pose, seed, dir)
+    }
+
     fn energy(
         &self,
         translation: &[f64],
@@ -844,10 +1056,19 @@ impl Score for DNA {
         }
         *self
             .gpu_state
-            .get_or_init(|| crate::gpu_score::cuda_available())
+            .get_or_init(batch_accel_available)
     }
 
     fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        #[cfg(feature = "metal")]
+        if !self.use_anm {
+            if let Some(scores) =
+                crate::metal_score::batch_energy_metal_scores(self, translations, rotations)
+            {
+                return scores;
+            }
+        }
+        #[cfg(feature = "cuda")]
         if !self.use_anm {
             if let Some(scores) = crate::gpu_score::batch_energy_gpu_scores(
                 self,
@@ -862,6 +1083,23 @@ impl Score for DNA {
             .zip(rotations.iter())
             .map(|(t, r)| self.energy_grid(t, r, &[], &[]))
             .collect()
+    }
+}
+
+/// Whether this build has a usable batch accelerator (probed once, cached in
+/// `DNA::gpu_state` and consumed by `Score::supports_batch`).
+fn batch_accel_available() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        return crate::gpu_score::cuda_available();
+    }
+    #[cfg(feature = "metal")]
+    {
+        return crate::metal_score::metal_available();
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        false
     }
 }
 

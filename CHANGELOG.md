@@ -8,6 +8,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.1] — 2026-09-06
+
+### Added: Apple Silicon Metal GPU backend (opt-in `metal` feature)
+
+- `src/metal/lk_metal.m` + `src/metal_score.rs`: persistent Metal batch scorer
+  (near 10 Å cell-list + far 0.5 Å trilinear kernels, line-for-line MSL port of
+  the CUDA numerics), wired with a metal → cuda → CPU-grid fallback chain.
+- Pose transforms stay on the CPU in f64; shared-`MTLBuffer` zero-copy upload on
+  unified memory sidesteps the lack of fast fp64 on Apple GPUs; per-atom f32
+  accumulation matches the CUDA budget.
+- Measured on Mac mini M4 (1AZP, `dna`, 1000×1000, seed 324324): end-to-end
+  6.22 s ≈ 7.6× vs CPU grid / 35.3× vs exact; best −7254.95161080 bit-identical
+  to the RTX 5090 CUDA engine.
+- Plain (no-feature) builds are byte-for-byte unchanged from v1.2.0.
+
+### Developer-only
+
+- Env-gated `dump_metal_dataset` + `poc_dump` bin export kernel-development
+  datasets (not used by the normal engine path).
+
+---
+
 ## [1.2.0] — 2026-09-05
 
 ### Added: Far-field grid at 0.5 Å reference resolution (default)
