@@ -453,7 +453,6 @@ impl Score for PYDOCK {
     ) -> f64 {
         self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
     }
-}
 
     fn supports_batch(&self) -> bool {
         if self.use_anm {
@@ -536,6 +535,8 @@ mod tests {
             use_anm: false,
             cells: OnceLock::new(),
             field: OnceLock::new(),
+            gpu_state: OnceLock::new(),
+            gpu: OnceLock::new(),
         };
         let energy = s.energy_grid(&translation, &rotation, &Vec::new(), &Vec::new());
         let exact0 = s.energy_exact(&translation, &rotation, &Vec::new(), &Vec::new());
