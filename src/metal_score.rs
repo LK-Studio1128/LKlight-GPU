@@ -19,7 +19,8 @@
 
 use crate::dna::{DNA, DNADockingModel};
 use crate::grid_dna::ReceptorField;
-use crate::gpu_score::{CudaReceptor};
+use crate::gpu_family::FamilyGpu;
+use crate::gpu_score::{CudaReceptor, FLAGS_DNA};
 use crate::qt::{rot3_apply, Quaternion};
 use std::ffi::c_void;
 
@@ -56,6 +57,7 @@ extern "C" {
         l_heavy: *const u8,
         nl: i32,
         tg: i32,
+        mode: i32,
     ) -> *mut c_void;
     fn lk_metal_score(
         ctx: *mut c_void,
@@ -90,6 +92,58 @@ impl MetalCtx {
         crec: &CudaReceptor,
         lig: &DNADockingModel,
         tg: i32,
+    ) -> Option<MetalCtx> {
+        Self::create_raw(field, crec, lig, tg, FLAGS_DNA as i32)
+    }
+
+    /// Create a context for an all-atom family (DNA/PYDOCK/VDW) sharing the
+    /// family GPU dataset. `field` is `None` for VDW (flags clear F_FAR; the
+    /// shim keeps a 1-element placeholder phi).
+    pub fn create_family(
+        g: &FamilyGpu,
+        field: Option<&ReceptorField>,
+        tg: i32,
+        flags: u32,
+    ) -> Option<MetalCtx> {
+        let nl = (g.clig.len() / 3) as i32;
+        if nl == 0 {
+            return None;
+        }
+        let mut dummy: f32 = 0.0;
+        let (phi, nxd, nyd, nzd, oxf, oyf, ozf, spf) = match field {
+            Some(f) if !f.phi.is_empty() => (
+                f.phi.as_ptr(), f.n[0] as i32, f.n[1] as i32, f.n[2] as i32,
+                f.origin[0] as f32, f.origin[1] as f32, f.origin[2] as f32, f.spacing as f32,
+            ),
+            _ if flags & crate::gpu_score::F_FAR != 0 => return None,
+            _ => (&dummy as *const f32, 1, 1, 1, 0.0f32, 0.0f32, 0.0f32, 1.0f32),
+        };
+        let crec = &g.crec;
+        let ptr = unsafe {
+            lk_metal_ctx_create(
+                phi, nxd, nyd, nzd, oxf, oyf, ozf, spf,
+                crec.r_coords.as_ptr(), crec.r_ele.as_ptr(), crec.r_svdw.as_ptr(),
+                crec.r_vdwr.as_ptr(), crec.r_heavy.as_ptr(), (crec.r_coords.len() / 3) as i32,
+                crec.cell_start.as_ptr(), crec.cell_atoms.as_ptr(),
+                crec.ncx, crec.ncy, crec.ncz, crec.c_ox, crec.c_oy, crec.c_oz, crec.c_sp,
+                g.le.as_ptr(), g.lsv.as_ptr(), g.lv.as_ptr(), g.lh.as_ptr(),
+                nl, tg, flags as i32,
+            )
+        };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(MetalCtx { ptr })
+        }
+    }
+
+    /// (internal) raw create with an explicit mode word.
+    fn create_raw(
+        field: &ReceptorField,
+        crec: &CudaReceptor,
+        lig: &DNADockingModel,
+        tg: i32,
+        mode: i32,
     ) -> Option<MetalCtx> {
         let nl = lig.coordinates.len();
         if nl == 0 || field.phi.is_empty() {
@@ -130,6 +184,7 @@ impl MetalCtx {
                 lh.as_ptr(),
                 nl as i32,
                 tg,
+                mode,
             )
         };
         if ptr.is_null() {
@@ -237,4 +292,56 @@ pub fn batch_energy_metal_scores(
     _rotations: &[Quaternion],
 ) -> Option<Vec<f64>> {
     None
+}
+
+/// Metal batched scoring for the all-atom families (DNA/PYDOCK/VDW) on a
+/// shared per-family context. `base_coords` are the ligand reference
+/// coordinates in f64 — the rigid transform runs on the CPU in f64 (identical
+/// math to the CPU grid path), then the f32 float3 pose-major buffer is
+/// zero-copied to the Metal shared buffer.
+#[cfg(feature = "metal")]
+pub fn batch_metal_family_scores(
+    ctx: &MetalCtx,
+    base_coords: &[[f64; 3]],
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+) -> Option<Vec<f64>> {
+    let n_pose = translations.len();
+    let nl = base_coords.len();
+    if n_pose == 0 || nl == 0 {
+        return None;
+    }
+    let mut lc: Vec<f32> = Vec::with_capacity(n_pose * nl * 3);
+    for (t, r) in translations.iter().zip(rotations.iter()) {
+        let rot = r.to_matrix();
+        for c in base_coords.iter() {
+            let pp = rot3_apply(&rot, *c);
+            lc.push((pp[0] + t[0]) as f32);
+            lc.push((pp[1] + t[1]) as f32);
+            lc.push((pp[2] + t[2]) as f32);
+        }
+    }
+    let mut oe = vec![0.0f32; n_pose];
+    let mut ov = vec![0.0f32; n_pose];
+    let ret = unsafe {
+        lk_metal_score(
+            ctx.ptr,
+            lc.as_ptr(),
+            n_pose as i32,
+            oe.as_mut_ptr(),
+            ov.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("[metal_score] Metal family BATCH scoring ACTIVE ({} poses × {} atoms)",
+                  n_pose, nl);
+    }
+    const FACTOR: f64 = 332.0;
+    const EPSILON: f64 = 4.0;
+    Some((0..n_pose).map(|k| -(oe[k] as f64 * FACTOR / EPSILON + ov[k] as f64)).collect())
 }

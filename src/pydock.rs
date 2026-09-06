@@ -172,6 +172,8 @@ pub struct PYDOCK {
     field: OnceLock<ReceptorField>,
     gpu_state: OnceLock<bool>,
     gpu: OnceLock<Option<crate::gpu_family::FamilyGpu>>,
+    #[cfg(feature = "metal")]
+    metal_ctx: OnceLock<Option<crate::metal_score::MetalCtx>>,
 }
 
 impl<'a> PYDOCK {
@@ -208,6 +210,8 @@ impl<'a> PYDOCK {
             field: OnceLock::new(),
             gpu_state: OnceLock::new(),
             gpu: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx: OnceLock::new(),
         };
         Box::new(d)
     }
@@ -469,6 +473,38 @@ impl Score for PYDOCK {
     }
 
     fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        #[cfg(feature = "metal")]
+        if !self.use_anm {
+            let cached = self.gpu.get_or_init(|| {
+                Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
+            });
+            if let Some(g) = cached.as_ref() {
+                let field = self.field.get_or_init(|| {
+                    ReceptorField::build(
+                        &self.receptor.coordinates,
+                        &self.receptor.ele_charges,
+                    )
+                });
+                let ctx = self.metal_ctx.get_or_init(|| {
+                    crate::metal_score::MetalCtx::create_family(
+                        g,
+                        Some(field),
+                        crate::metal_score::METAL_TG,
+                        crate::gpu_family::family_flags("pydock"),
+                    )
+                });
+                if let Some(c) = ctx.as_ref() {
+                    if let Some(scores) = crate::metal_score::batch_metal_family_scores(
+                        c,
+                        &self.ligand.coordinates,
+                        translations,
+                        rotations,
+                    ) {
+                        return scores;
+                    }
+                }
+            }
+        }
         #[cfg(feature = "cuda")]
         if !self.use_anm {
             let cached = self.gpu.get_or_init(|| {
@@ -537,6 +573,8 @@ mod tests {
             field: OnceLock::new(),
             gpu_state: OnceLock::new(),
             gpu: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx: OnceLock::new(),
         };
         let energy = s.energy_grid(&translation, &rotation, &Vec::new(), &Vec::new());
         let exact0 = s.energy_exact(&translation, &rotation, &Vec::new(), &Vec::new());

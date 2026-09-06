@@ -32,6 +32,7 @@ static const char *LK_MSL =
 "constant float CP_W = 6.0f;\n"
 "constant float CP_F = 0.75f;\n"
 "constant float ES_CAP = 0.01204819f;\n"
+"// Family flags (buffer 11 sizes[3]): LJ always on. FAR=1 ELEC=2 CLASH=4.\n"
 "inline float sample_phi(device const float* phi, int nx, int ny, int nz,\n"
 "                        float ox, float oy, float oz, float sp,\n"
 "                        float x, float y, float z) {\n"
@@ -74,6 +75,7 @@ static const char *LK_MSL =
 "    uint tg_sz [[threads_per_threadgroup]])\n"
 "{\n"
 "    const int nl = sizes[1];\n"
+"    const uint flags = (uint)sizes[3];\n"
 "    float2 elec=float2(0.f,0.f), vdw=float2(0.f,0.f);\n"
 "    for (int j=(int)lid; j<nl; j+=(int)tg_sz) {\n"
 "        const int nx=fdims[0], ny=fdims[1], nz=fdims[2];\n"
@@ -85,7 +87,7 @@ static const char *LK_MSL =
 "        float x=lc[p3], y=lc[p3+1], z=lc[p3+2];\n"
 "        float4 lq=lpp[j];\n"
 "        float qj=lq.x, svdwj=lq.y, vdwrj=lq.z; bool hj = lq.w>0.5f;\n"
-"        if (qj!=0.f) {\n"
+"        if ((flags & 1u) && qj!=0.f) {\n"
 "            float2 t=kadd(elec, qj*sample_phi(phi,nx,ny,nz,ox,oy,oz,sp,x,y,z)); elec=t;\n"
 "        }\n"
 "        int cxi=(int)floor((x-c_ox)/c_sp), cyi=(int)floor((y-c_oy)/c_sp), czi=(int)floor((z-c_oz)/c_sp);\n"
@@ -104,16 +106,18 @@ static const char *LK_MSL =
 "                        float d2=dxf*dxf+dyf*dyf+dzf*dzf;\n"
 "                        if (d2<=NEAR2) {\n"
 "                            float4 rB=rpp[i];\n"
-"                            float ae=qj*rA.w/d2;\n"
-"                            if (ae>ES_CAP) ae=ES_CAP;\n"
-"                            if (ae<-ES_CAP) ae=-ES_CAP;\n"
-"                            float2 t=kadd(elec,ae); elec=t;\n"
+"                            if (flags & 2u) {\n"
+"                                float ae=qj*rA.w/d2;\n"
+"                                if (ae>ES_CAP) ae=ES_CAP;\n"
+"                                if (ae<-ES_CAP) ae=-ES_CAP;\n"
+"                                float2 t=kadd(elec,ae); elec=t;\n"
+"                            }\n"
 "                            float sv=svdwj*rB.x;\n"
 "                            float rr=vdwrj+rB.y;\n"
 "                            float p6=(rr*rr)*(rr*rr)*(rr*rr)/(d2*d2*d2);\n"
 "                            float vp=sv*(p6*p6-2.f*p6);\n"
 "                            if (vp>LJ_CAP) vp=LJ_CAP;\n"
-"                            if (hj && rB.z>0.5f) {\n"
+"                            if ((flags & 4u) && hj && rB.z>0.5f) {\n"
 "                                float dmin=CP_F*rr;\n"
 "                                if (d2<dmin*dmin) vp+=CP_W*(dmin-sqrt(d2));\n"
 "                            }\n"
@@ -181,7 +185,7 @@ void *lk_metal_ctx_create(
     float c_ox, float c_oy, float c_oz, float c_sp,
     const float *l_ele, const float *l_svdw, const float *l_vdwr,
     const unsigned char *l_heavy, int nl,
-    int tg) {
+    int tg, int mode) {
     @autoreleasepool {
         NSError *err = nil;
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -204,7 +208,11 @@ void *lk_metal_ctx_create(
 
         int phiN = nx * ny * nz;
         int csN = (ncx + 1) * (ncy + 1) * (ncz + 1) + 1;   // cell_start incl. sentinel
-        if (phiN <= 0 || nr <= 0 || nl <= 0 || csN <= 0) return NULL;
+        if (nr <= 0 || nl <= 0 || csN <= 0) return NULL;
+        // VDW family has no far field (flags clear FAR): hand a 1-element
+        // placeholder grid — the kernel never samples phi without the FAR flag.
+        float zphi = 0.f;
+        if (phiN <= 0) { nx = ny = nz = 1; phiN = 1; phi = &zphi; }
 
         LkMetalCtx *c = calloc(1, sizeof(LkMetalCtx));
         if (!c) return NULL;
@@ -244,7 +252,7 @@ void *lk_metal_ctx_create(
         float fgeo[4] = {ox, oy, oz, sp};
         int32_t cgi[3] = {ncx, ncy, ncz};
         float cgf[4] = {c_ox, c_oy, c_oz, c_sp};
-        int32_t sizes[4] = {nr, nl, 0, 0};   // [3] = mode (0 = full)
+        int32_t sizes[4] = {nr, nl, 0, mode};   // [3] = per-family flags
 
         c->bphi = [device newBufferWithBytes:phi length:(NSUInteger)phiN * 4
                                      options:MTLResourceStorageModeShared];
@@ -289,6 +297,7 @@ int lk_metal_score(void *vctx, const float *lc, int n_pose,
         if (ensure_buffers(c, n_pose) != 0) return -1;
         int32_t *szm = (int32_t *)c->bsz.contents;
         szm[2] = n_pose;
+        // sizes[3] keeps the family flags set at ctx_create
         memcpy(c->blc.contents, lc, (size_t)n_pose * (size_t)c->nl * 12);
         MTLSize groups = MTLSizeMake((NSUInteger)n_pose, 1, 1);
         MTLSize threads = MTLSizeMake((NSUInteger)c->tg, 1, 1);
