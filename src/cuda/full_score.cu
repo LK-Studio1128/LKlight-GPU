@@ -524,7 +524,7 @@ __global__ void cpydock_min_kernel(
                     if (!lf && r_flag[i] == 0) {
                         // receptor-atom minimum: int-ordered atomic min (d2>0)
                         // [bisect] temporarily disabled
-                        // atomicMin(&dminR[(size_t)pose * nr + i], __float_as_int(d2));
+                        // // [bisect] atomicMin(&dminR[(size_t)pose * nr + i], __float_as_int(d2));
                     }
                 }
             }
