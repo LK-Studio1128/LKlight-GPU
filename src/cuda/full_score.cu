@@ -524,7 +524,7 @@ __global__ void cpydock_min_kernel(
                     if (!lf && r_flag[i] == 0) {
                         // receptor-atom minimum: int-ordered atomic min (d2>0)
                         // [bisect] temporarily disabled
-                        // // [bisect] atomicMin(&dminR[(size_t)pose * nr + i], __float_as_int(d2));
+                        // atomicMin(&dminR[(size_t)pose * nr + i], __float_as_int(d2));
                     }
                 }
             }
@@ -575,47 +575,80 @@ extern "C" int cuda_cpydock_solv(
     int ncx, int ncy, int ncz,
     float c_ox, float c_oy, float c_oz, float c_sp,
     const float* l_base, const double* poses,
-    const unsigned char* l_flag, const float* l_ele_l /*unused*/, int nl,
+    const unsigned char* l_flag, const float* l_ele, int nl,
     int N,
     const float* r_des, const float* r_asa,
     const float* l_des, const float* l_asa,
     double* outS)
 {
-    // One static cache for the per-pose min buffers (sized to N×nr / N×nl).
+    // Persistent device cache for the constant arrays (receptor cell/params +
+    // ligand base + desolvation arrays) and the per-pose scratch buffers.
+    static float *d_rc = 0, *d_lb = 0, *d_rd = 0, *d_ra = 0, *d_ld = 0, *d_la = 0;
+    static unsigned char *d_rf = 0, *d_lf = 0;
+    static int *d_cs = 0, *d_ca = 0;
     static int *dminR = 0; static float *dminL = 0;
     static double *d_out = 0;
     static int cap_nr = 0, cap_nl = 0, cap_N = 0;
     cudaError_t err; int st = 0;
 #define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
-    if (N > cap_N || nr > cap_nr || nl > cap_nl) {
-        if (dminR) cudaFree(dminR);
-        if (dminL) cudaFree(dminL);
-        if (d_out) cudaFree(d_out);
+    if (nr != cap_nr || nl != cap_nl) {
+        if (cap_nr) {
+            cudaFree(d_rc); cudaFree(d_rf); cudaFree(d_cs); cudaFree(d_ca);
+            cudaFree(d_rd); cudaFree(d_ra); cudaFree(d_lb); cudaFree(d_lf);
+            cudaFree(d_ld); cudaFree(d_la); cudaFree(dminR); cudaFree(dminL); cudaFree(d_out);
+        }
         st = 10;
-        CK(cudaMalloc(&dminR,(size_t)N*nr*sizeof(int)));
-        st = 11;
-        CK(cudaMalloc(&dminL,(size_t)N*nl*sizeof(float)));
-        st = 12;
-        CK(cudaMalloc(&d_out,(size_t)N*sizeof(double)));
-        cap_nr=nr; cap_nl=nl; cap_N=N;
+        CK(cudaMalloc(&d_rc,(size_t)nr*3*sizeof(float)));
+        CK(cudaMalloc(&d_rf,(size_t)nr));
+        size_t csb=(size_t)((ncx+1)*(ncy+1)*(ncz+1)+1)*sizeof(int);
+        CK(cudaMalloc(&d_cs,csb));
+        CK(cudaMalloc(&d_ca,(size_t)nr*sizeof(int)));
+        CK(cudaMalloc(&d_rd,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&d_ra,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&d_lb,(size_t)nl*3*sizeof(float)));
+        CK(cudaMalloc(&d_lf,(size_t)nl));
+        CK(cudaMalloc(&d_ld,(size_t)nl*sizeof(float)));
+        CK(cudaMalloc(&d_la,(size_t)nl*sizeof(float)));
+        CK(cudaMemcpy(d_rc,r_coords,(size_t)nr*3*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_rf,r_flag,(size_t)nr,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_cs,cell_start,csb,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ca,cell_atoms,(size_t)nr*sizeof(int),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_rd,r_des,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ra,r_asa,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_lb,l_base,(size_t)nl*3*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_lf,l_flag,(size_t)nl,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ld,l_des,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_la,l_asa,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        cap_nr=nr; cap_nl=nl;
     }
-    // Stage A
+    if (N > cap_N) {
+        if (cap_N) { cudaFree(dminR); cudaFree(dminL); cudaFree(d_out); }
+        CK(cudaMalloc(&dminR,(size_t)N*nr*sizeof(int)));
+        CK(cudaMalloc(&dminL,(size_t)N*nl*sizeof(float)));
+        CK(cudaMalloc(&d_out,(size_t)N*sizeof(double)));
+        cap_N=N;
+    }
+    // per-step pose upload (small)
+    double *d_ps = 0;
+    CK(cudaMalloc(&d_ps,(size_t)N*7*sizeof(double)));
+    CK(cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice));
+    // Stage A: min collection (device atomics; int-ordered on d2>0 bits)
     st = 13;
-    CK(cudaMemset(dminR, 0x7F, (size_t)N*nr*sizeof(int)));   // +inf bits
+    CK(cudaMemset(dminR, 0x7F, (size_t)N*nr*sizeof(int)));
     {
         int threads = 256;
         int bx = (nl + threads - 1) / threads;
         dim3 grid(bx, N);
         cpydock_min_kernel<<<grid, threads>>>(
-            r_coords, r_flag, cell_start, cell_atoms,
-            ncx, ncy, ncz, c_ox, c_oy, c_oz, c_sp,
-            l_base, poses, l_flag, nr, nl, N, dminR, dminL);
+            d_rc, d_rf, d_cs, d_ca, ncx, ncy, ncz, c_ox, c_oy, c_oz, c_sp,
+            d_lb, d_ps, d_lf, nr, nl, N, dminR, dminL);
         st = 14;
         CK(cudaGetLastError());
     }
     st = 15;
-    CK(cudaDeviceSynchronize()); st = 1; st = 1;
-    // Stage B (multi-block reduce into outS)
+    CK(cudaDeviceSynchronize());
+    // Stage B: desolvation reduce
+    st = 16;
     CK(cudaMemset(d_out, 0, (size_t)N*sizeof(double)));
     {
         int threads = 256;
@@ -623,15 +656,18 @@ extern "C" int cuda_cpydock_solv(
         if (bx < 8) bx = 8; if (bx > 64) bx = 64;
         dim3 grid(bx, N);
         cpydock_solv_kernel<<<grid, threads, threads*sizeof(float)>>>(
-            dminR, dminL, r_asa, r_des, l_asa, l_des, nr, nl, N, d_out);
+            dminR, dminL, d_ra, d_rd, d_la, d_ld, nr, nl, N, d_out);
+        st = 17;
         CK(cudaGetLastError());
     }
-    CK(cudaDeviceSynchronize()); st = 2;
+    CK(cudaDeviceSynchronize());
     CK(cudaMemcpy(outS, d_out, (size_t)N*sizeof(double), cudaMemcpyDeviceToHost));
+    cudaFree(d_ps);
     return 0;
 fail:
     { const char* m=cudaGetErrorString(err);
       fprintf(stderr,"cuda_cpydock_solv error stage=%d N=%d nr=%d nl=%d: %s\n", st, N, nr, nl, m); }
+    if (d_ps) cudaFree(d_ps);
     return -1;
-#undef CK
+
 }
