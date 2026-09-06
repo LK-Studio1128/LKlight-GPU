@@ -749,7 +749,7 @@ impl Score for CPYDOCK {
                                 .iter()
                                 .zip(v0.iter())
                                 .zip(s.iter())
-                                .map(|((t, v), s)| t + 0.9 * v + s)
+                                .map(|((t, v), s)| t - 0.9 * v + s)
                                 .collect();
                         }
                     }
