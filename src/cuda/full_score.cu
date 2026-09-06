@@ -590,6 +590,7 @@ extern "C" int cuda_cpydock_solv(
     static double *d_out = 0;
     static int cap_nr = 0, cap_nl = 0, cap_N = 0;
     cudaError_t err; int st = 0;
+    double *d_ps = 0;
 #define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
     if (nr != cap_nr || nl != cap_nl) {
         if (cap_nr) {
@@ -629,7 +630,6 @@ extern "C" int cuda_cpydock_solv(
         cap_N=N;
     }
     // per-step pose upload (small)
-    double *d_ps = 0;
     CK(cudaMalloc(&d_ps,(size_t)N*7*sizeof(double)));
     CK(cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice));
     // Stage A: min collection (device atomics; int-ordered on d2>0 bits)
