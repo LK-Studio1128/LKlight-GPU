@@ -50,6 +50,24 @@ impl FamilyMol for crate::pydock::PYDOCKDockingModel {
     }
 }
 
+impl FamilyMol for crate::cpydock::CPYDOCKDockingModel {
+    fn coords(&self) -> &[[f64; 3]] {
+        &self.coordinates
+    }
+    fn ele(&self) -> &[f64] {
+        &self.ele_charges
+    }
+    fn sqrt_vdw(&self) -> &[f64] {
+        &self.sqrt_vdw_charges
+    }
+    fn vdw_radii(&self) -> &[f64] {
+        &self.vdw_radii
+    }
+    fn heavy(&self) -> Option<&[u8]> {
+        None
+    }
+}
+
 /// Cacheable GPU-ready dataset for one scorer instance (receptor + ligand +
 /// optional field). Built once, cached in a `OnceLock`, reused every step.
 pub struct FamilyGpu {
@@ -277,4 +295,90 @@ pub fn family_batch_available() -> bool {
     {
         false
     }
+}
+
+/// CPYDOCK desolvation arrays (per-model): the C-compatible exclusion mask
+/// flag(i) = (i even) && hydrogens[i/2]!=0 (1 = excluded from min counting),
+/// plus per-atom desolvation coefficient and reference SASA.
+pub struct CpySolvSide {
+    pub flag: Vec<u8>,
+    pub des: Vec<f32>,
+    pub asa: Vec<f32>,
+}
+
+/// Batched CUDA desolvation for CPYDOCK: returns per-pose S (the desolvation
+/// energy already subtracted in score = -(E·332/4 + 0.1·V − S)), or None on
+/// failure. Runs the two-stage min/reduce kernels on the shared pose buffer.
+#[cfg(feature = "cuda")]
+pub fn batch_cuda_cpydock_solv(
+    g: &FamilyGpu,
+    field: Option<&ReceptorField>,
+    solv_r: &CpySolvSide,
+    solv_l: &CpySolvSide,
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+) -> Option<Vec<f64>> {
+    extern "C" {
+        #[allow(clippy::too_many_arguments)]
+        fn cuda_cpydock_solv(
+            r_coords: *const f32, r_flag: *const u8, nr: i32,
+            cell_start: *const i32, cell_atoms: *const i32,
+            ncx: i32, ncy: i32, ncz: i32,
+            c_ox: f32, c_oy: f32, c_oz: f32, c_sp: f32,
+            l_base: *const f32, poses: *const f64,
+            l_flag: *const u8, l_ele: *const f32, nl: i32, n_pose: i32,
+            r_des: *const f32, r_asa: *const f32,
+            l_des: *const f32, l_asa: *const f32,
+            out_s: *mut f64,
+        ) -> i32;
+    }
+    let n_pose = translations.len();
+    let nl = (g.clig.len() / 3) as i32;
+    let nr = (g.crec.r_coords.len() / 3) as i32;
+    if n_pose == 0 || nl == 0 || nr == 0 || solv_r.flag.len() != nr as usize
+        || solv_l.flag.len() != nl as usize {
+        return None;
+    }
+    let _ = field; // desolv needs no far field
+    let crec = &g.crec;
+    let mut poses: Vec<f64> = Vec::with_capacity(n_pose * 7);
+    for (t, r) in translations.iter().zip(rotations.iter()) {
+        poses.push(r.w);
+        poses.push(r.x);
+        poses.push(r.y);
+        poses.push(r.z);
+        poses.push(t[0]);
+        poses.push(t[1]);
+        poses.push(t[2]);
+    }
+    let mut out = vec![0.0f64; n_pose];
+    let ret = unsafe {
+        cuda_cpydock_solv(
+            crec.r_coords.as_ptr(), solv_r.flag.as_ptr(), nr,
+            crec.cell_start.as_ptr(), crec.cell_atoms.as_ptr(),
+            crec.ncx, crec.ncy, crec.ncz,
+            crec.c_ox, crec.c_oy, crec.c_oz, crec.c_sp,
+            g.clig.as_ptr(), poses.as_ptr(),
+            solv_l.flag.as_ptr(), g.le.as_ptr(), nl, n_pose as i32,
+            solv_r.des.as_ptr(), solv_r.asa.as_ptr(),
+            solv_l.des.as_ptr(), solv_l.asa.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn batch_cuda_cpydock_solv(
+    _g: &FamilyGpu,
+    _field: Option<&ReceptorField>,
+    _solv_r: &CpySolvSide,
+    _solv_l: &CpySolvSide,
+    _translations: &[[f64; 3]],
+    _rotations: &[Quaternion],
+) -> Option<Vec<f64>> {
+    None
 }
