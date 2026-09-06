@@ -170,6 +170,8 @@ pub struct PYDOCK {
     pub use_anm: bool,
     cells: OnceLock<NearCells>,
     field: OnceLock<ReceptorField>,
+    gpu_state: OnceLock<bool>,
+    gpu: OnceLock<Option<crate::gpu_family::FamilyGpu>>,
 }
 
 impl<'a> PYDOCK {
@@ -204,6 +206,8 @@ impl<'a> PYDOCK {
             use_anm,
             cells: OnceLock::new(),
             field: OnceLock::new(),
+            gpu_state: OnceLock::new(),
+            gpu: OnceLock::new(),
         };
         Box::new(d)
     }
@@ -448,6 +452,52 @@ impl Score for PYDOCK {
         lig_nmodes: &[f64],
     ) -> f64 {
         self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
+    }
+}
+
+    fn supports_batch(&self) -> bool {
+        if self.use_anm {
+            return false;
+        }
+        if !self.receptor.active_restraints.is_empty()
+            || !self.ligand.active_restraints.is_empty()
+            || !self.receptor.membrane.is_empty()
+            || !self.ligand.membrane.is_empty()
+        {
+            return false;
+        }
+        *self.gpu_state.get_or_init(crate::gpu_family::family_batch_available)
+    }
+
+    fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        #[cfg(feature = "cuda")]
+        if !self.use_anm {
+            let cached = self.gpu.get_or_init(|| {
+                Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
+            });
+            if let Some(g) = cached.as_ref() {
+                let field = self.field.get_or_init(|| {
+                    ReceptorField::build(
+                        &self.receptor.coordinates,
+                        &self.receptor.ele_charges,
+                    )
+                });
+                if let Some(scores) = crate::gpu_family::batch_cuda_family(
+                    g,
+                    Some(field),
+                    translations,
+                    rotations,
+                    crate::gpu_family::family_flags("pydock"),
+                ) {
+                    return scores;
+                }
+            }
+        }
+        translations
+            .iter()
+            .zip(rotations.iter())
+            .map(|(t, r)| self.energy_grid(t, r, &[], &[]))
+            .collect()
     }
 }
 

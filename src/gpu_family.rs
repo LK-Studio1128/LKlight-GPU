@@ -59,7 +59,6 @@ pub struct FamilyGpu {
     pub lsv: Vec<f32>,
     pub lv: Vec<f32>,
     pub lh: Vec<u8>,
-    pub field: Option<ReceptorField>,
 }
 
 fn build_crec(coords: &[[f64; 3]], ele: &[f64], svdw: &[f64], radii: &[f64],
@@ -135,18 +134,14 @@ fn build_crec(coords: &[[f64; 3]], ele: &[f64], svdw: &[f64], radii: &[f64],
     }
 }
 
-/// Build the cached GPU dataset for a scorer (family flags decide whether the
-/// receptor far-field is needed: VDW clears F_FAR → `field = None`).
+/// Build the cached GPU dataset for a scorer. The receptor far-field is NOT
+/// owned here: the caller already holds one (DNA/PYDOCK/CPYDOCK build it for
+/// the CPU grid path) and passes it per call — VDW simply passes `None` (its
+/// flags clear F_FAR). This avoids building the 0.5 Å field twice per run.
 pub fn build_family<M: FamilyMol>(
     rec: &M,
     lig: &M,
-    use_field: bool,
 ) -> FamilyGpu {
-    let field = if use_field {
-        Some(ReceptorField::build(rec.coords(), rec.ele()))
-    } else {
-        None
-    };
     let crec = build_crec(rec.coords(), rec.ele(), rec.sqrt_vdw(), rec.vdw_radii(), rec.heavy());
     let mut clig = Vec::with_capacity(lig.coords().len() * 3);
     for c in lig.coords().iter() {
@@ -165,7 +160,6 @@ pub fn build_family<M: FamilyMol>(
         lsv: lig.sqrt_vdw().iter().map(|&x| x as f32).collect(),
         lv: lig.vdw_radii().iter().map(|&x| x as f32).collect(),
         lh: heavy,
-        field,
     }
 }
 
@@ -186,6 +180,7 @@ pub fn family_flags(method: &str) -> u32 {
 #[cfg(feature = "cuda")]
 pub fn batch_cuda_family(
     g: &FamilyGpu,
+    field: Option<&ReceptorField>,
     translations: &[[f64; 3]],
     rotations: &[Quaternion],
     flags: u32,
@@ -211,7 +206,7 @@ pub fn batch_cuda_family(
     // Field is only needed when F_FAR is set (DNA/PYDOCK/CPYDOCK); VDW (flags=0)
     // passes a dummy — the kernel never samples phi without F_FAR.
     let mut dummy: f32 = 0.0;
-    let (phi, nxd, nyd, nzd, oxf, oyf, ozf, spf) = match &g.field {
+    let (phi, nxd, nyd, nzd, oxf, oyf, ozf, spf) = match field {
         Some(f) if !f.phi.is_empty() => (
             f.phi.as_ptr(), f.n[0] as i32, f.n[1] as i32, f.n[2] as i32,
             f.origin[0] as f32, f.origin[1] as f32, f.origin[2] as f32, f.spacing as f32,
@@ -259,6 +254,7 @@ pub fn batch_cuda_family(
 #[cfg(not(feature = "cuda"))]
 pub fn batch_cuda_family(
     _g: &FamilyGpu,
+    _field: Option<&ReceptorField>,
     _translations: &[[f64; 3]],
     _rotations: &[Quaternion],
     _flags: u32,

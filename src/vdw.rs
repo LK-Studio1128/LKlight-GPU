@@ -275,15 +275,12 @@ impl Score for VDW {
         #[cfg(feature = "cuda")]
         if !self.use_anm {
             let cached = self.gpu.get_or_init(|| {
-                Some(crate::gpu_family::build_family(
-                    &self.receptor,
-                    &self.ligand,
-                    false,
-                ))
+                Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
             });
             if let Some(g) = cached.as_ref() {
                 if let Some(scores) = crate::gpu_family::batch_cuda_family(
                     g,
+                    None, // VDW has no far field (flags clear F_FAR)
                     translations,
                     rotations,
                     crate::gpu_family::family_flags("vdw"),
