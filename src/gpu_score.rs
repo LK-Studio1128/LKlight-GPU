@@ -18,6 +18,7 @@ pub const F_CLASH: u32 = 4;
 pub const FLAGS_DNA: u32 = F_FAR | F_ELEC | F_CLASH;
 pub const FLAGS_PYDOCK: u32 = F_FAR | F_ELEC;
 pub const FLAGS_VDW: u32 = 0;
+pub const F_DESOLV: u32 = 16;  // CPYDOCK contact-SASA desolvation (two-stage kernels)
 
 /// GPU-ready ligand parameter arrays. Built once and cached on [`crate::dna::DNA`]
 /// so the host pointers stay stable across GSO steps: the CUDA persistent-buffer

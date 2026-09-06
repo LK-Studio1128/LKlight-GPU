@@ -348,6 +348,10 @@ pub struct CPYDOCK {
     gpu: OnceLock<Option<crate::gpu_family::FamilyGpu>>,
     solv_r: OnceLock<Option<crate::gpu_family::CpySolvSide>>,
     solv_l: OnceLock<Option<crate::gpu_family::CpySolvSide>>,
+    #[cfg(feature = "metal")]
+    metal_ctx3: OnceLock<Option<crate::metal_score::MetalCtx>>,
+    #[cfg(feature = "metal")]
+    metal_ctx0: OnceLock<Option<crate::metal_score::MetalCtx>>,
 }
 
 impl CPYDOCK {
@@ -374,6 +378,10 @@ impl CPYDOCK {
             gpu: OnceLock::new(),
             solv_r: OnceLock::new(),
             solv_l: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx3: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx0: OnceLock::new(),
         })
     }
 }
@@ -698,7 +706,12 @@ impl Score for CPYDOCK {
     }
 
     fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
-        #[cfg(feature = "cuda")]
+        // score = -(E·332/4 + 0.1·V − S). Computed from GPU components as
+        //   T  = flags3 batch → -(E·332/4 + V)
+        //   v0 = flags0 batch (LJ only) → -V
+        //   ⇒ cp = T − 0.9·v0 + S = T + 0.9·V + S
+        // The per-model GPU dataset, the desolvation sides and the far field
+        // are shared by the CUDA and Metal branches below.
         if !self.use_anm {
             let cached = self.gpu.get_or_init(|| {
                 Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
@@ -718,39 +731,87 @@ impl Score for CPYDOCK {
                 })
             });
             if let (Some(g), Some(sr), Some(sl)) = (cached.as_ref(), sr.as_ref(), sl.as_ref()) {
-                let field = self.field.get_or_init(|| {
-                    ReceptorField::build(
-                        &self.receptor.coordinates,
-                        &self.receptor.ele_charges,
-                    )
-                });
-                // score = -(E·332/4 + 0.1·V − S):
-                //   T = flags3 batch → -(Ef + V)          ⇒ Ef+V = -T
-                //   V = flags0 batch (LJ only) → -V       ⇒ V_raw = -Vrun
-                //   ⇒ cp = T + V_raw − 0.1·V_raw + S = T + 0.9·V_raw + S
-                if let Some(t3) = crate::gpu_family::batch_cuda_family(
-                    g, Some(field), translations, rotations,
-                    crate::gpu_family::family_flags("pydock"),
-                ) {
-                    if let Some(v0) = crate::gpu_family::batch_cuda_family(
-                        g, None, translations, rotations,
-                        crate::gpu_family::family_flags("vdw"),
+                #[cfg(feature = "metal")]
+                {
+                    let field = self.field.get_or_init(|| {
+                        ReceptorField::build(
+                            &self.receptor.coordinates,
+                            &self.receptor.ele_charges,
+                        )
+                    });
+                    let c3 = self.metal_ctx3.get_or_init(|| {
+                        crate::metal_score::MetalCtx::create_cpydock(
+                            g,
+                            Some(field),
+                            crate::metal_score::METAL_TG,
+                            sr,
+                            sl,
+                        )
+                    });
+                    let c0 = self.metal_ctx0.get_or_init(|| {
+                        crate::metal_score::MetalCtx::create_family(
+                            g,
+                            None,
+                            crate::metal_score::METAL_TG,
+                            crate::gpu_family::family_flags("vdw"),
+                        )
+                    });
+                    if let (Some(c3), Some(c0)) = (c3.as_ref(), c0.as_ref()) {
+                        let done = (|| {
+                            let t3 = crate::metal_score::batch_metal_family_scores(
+                                c3, &self.ligand.coordinates, translations, rotations,
+                            )?;
+                            let v0 = crate::metal_score::batch_metal_family_scores(
+                                c0, &self.ligand.coordinates, translations, rotations,
+                            )?;
+                            let s = crate::metal_score::batch_metal_cpydock_solv(
+                                c3, &self.ligand.coordinates, translations, rotations,
+                            )?;
+                            Some(
+                                t3.iter().zip(v0.iter()).zip(s.iter())
+                                    .map(|((t, v), s)| t - 0.9 * v + s)
+                                    .collect::<Vec<f64>>(),
+                            )
+                        })();
+                        if let Some(scores) = done {
+                            return scores;
+                        }
+                    }
+                }
+                #[cfg(feature = "cuda")]
+                {
+                    let field = self.field.get_or_init(|| {
+                        ReceptorField::build(
+                            &self.receptor.coordinates,
+                            &self.receptor.ele_charges,
+                        )
+                    });
+                    if let Some(t3) = crate::gpu_family::batch_cuda_family(
+                        g, Some(field), translations, rotations,
+                        crate::gpu_family::family_flags("pydock"),
                     ) {
-                        if let Some(s) = crate::gpu_family::batch_cuda_cpydock_solv(
-                            g, Some(field), sr, sl, translations, rotations,
+                        if let Some(v0) = crate::gpu_family::batch_cuda_family(
+                            g, None, translations, rotations,
+                            crate::gpu_family::family_flags("vdw"),
                         ) {
-                            use std::sync::atomic::{AtomicBool, Ordering};
-                            static LOGGED: AtomicBool = AtomicBool::new(false);
-                            if !LOGGED.swap(true, Ordering::Relaxed) {
-                                eprintln!("[gpu_family] CUDA CPYDOCK BATCH + desolv ACTIVE ({} poses)",
-                                          translations.len());
+                            if let Some(s) = crate::gpu_family::batch_cuda_cpydock_solv(
+                                g, Some(field), sr, sl, translations, rotations,
+                            ) {
+                                use std::sync::atomic::{AtomicBool, Ordering};
+                                static LOGGED: AtomicBool = AtomicBool::new(false);
+                                if !LOGGED.swap(true, Ordering::Relaxed) {
+                                    eprintln!(
+                                        "[gpu_family] CUDA CPYDOCK BATCH + desolv ACTIVE ({} poses)",
+                                        translations.len()
+                                    );
+                                }
+                                return t3
+                                    .iter()
+                                    .zip(v0.iter())
+                                    .zip(s.iter())
+                                    .map(|((t, v), s)| t - 0.9 * v + s)
+                                    .collect();
                             }
-                            return t3
-                                .iter()
-                                .zip(v0.iter())
-                                .zip(s.iter())
-                                .map(|((t, v), s)| t - 0.9 * v + s)
-                                .collect();
                         }
                     }
                 }
