@@ -324,12 +324,15 @@ pub fn batch_energy_metal_scores(
 /// math to the CPU grid path), then the f32 float3 pose-major buffer is
 /// zero-copied to the Metal shared buffer.
 #[cfg(feature = "metal")]
-pub fn batch_metal_family_scores(
+/// Raw two-column Metal family batch: per-pose (E·332/4 in kcal, V in the
+/// raw cap-1.0 convention) — unfolded so callers can apply per-family weights
+/// (CPYDOCK: −(E + 0.1·V − S)) with a single kernel dispatch.
+pub fn metal_family_raw(
     ctx: &MetalCtx,
     base_coords: &[[f64; 3]],
     translations: &[[f64; 3]],
     rotations: &[Quaternion],
-) -> Option<Vec<f64>> {
+) -> Option<(Vec<f64>, Vec<f64>)> {
     let n_pose = translations.len();
     let nl = base_coords.len();
     if n_pose == 0 || nl == 0 {
@@ -367,7 +370,31 @@ pub fn batch_metal_family_scores(
     }
     const FACTOR: f64 = 332.0;
     const EPSILON: f64 = 4.0;
-    Some((0..n_pose).map(|k| -(oe[k] as f64 * FACTOR / EPSILON + ov[k] as f64)).collect())
+    Some((
+        (0..n_pose).map(|k| oe[k] as f64 * FACTOR / EPSILON).collect(),
+        (0..n_pose).map(|k| ov[k] as f64).collect(),
+    ))
+}
+
+/// Folded Metal family batch: per-pose score = −(E·332/4 + V).
+pub fn batch_metal_family_scores(
+    ctx: &MetalCtx,
+    base_coords: &[[f64; 3]],
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+) -> Option<Vec<f64>> {
+    metal_family_raw(ctx, base_coords, translations, rotations)
+        .map(|(e, v)| e.iter().zip(v.iter()).map(|(e, v)| -(e + v)).collect())
+}
+
+/// Two-column Metal family batch as (E·332/4, V).
+pub fn batch_metal_family_parts(
+    ctx: &MetalCtx,
+    base_coords: &[[f64; 3]],
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    metal_family_raw(ctx, base_coords, translations, rotations)
 }
 
 /// Create a Metal context for CPYDOCK: the family kernel runs with

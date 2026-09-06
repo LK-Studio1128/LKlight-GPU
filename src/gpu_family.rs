@@ -196,7 +196,10 @@ pub fn family_flags(method: &str) -> u32 {
 /// CUDA batched scoring for a family. Returns per-pose total scores or `None`
 /// on any failure (caller falls back to the CPU grid path).
 #[cfg(feature = "cuda")]
-pub fn batch_cuda_family(
+/// Raw two-column family batch: out[2k] = raw electrostatics (·332/4 for
+/// kcal), out[2k+1] = vdW — unfolded so callers can combine per-family weights
+/// (e.g. CPYDOCK's 0.1·V − S) with a single kernel dispatch.
+pub fn cuda_family_raw(
     g: &FamilyGpu,
     field: Option<&ReceptorField>,
     translations: &[[f64; 3]],
@@ -264,9 +267,45 @@ pub fn batch_cuda_family(
         eprintln!("[gpu_family] CUDA family BATCH scoring ACTIVE ({} poses x {} atoms, flags={})",
                   n_pose, nl, flags);
     }
-    const FACTOR: f64 = 332.0;
-    const EPSILON: f64 = 4.0;
-    Some((0..n_pose).map(|k| -(out[2 * k] * FACTOR / EPSILON + out[2 * k + 1])).collect())
+    Some(out)
+}
+
+#[cfg(feature = "cuda")]
+/// Folded family batch: per-pose score = −(E·332/4 + V), as used by
+/// DNA/PYDOCK/VDW (E = 0 for VDW).
+pub fn batch_cuda_family(
+    g: &FamilyGpu,
+    field: Option<&ReceptorField>,
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+    flags: u32,
+) -> Option<Vec<f64>> {
+    cuda_family_raw(g, field, translations, rotations, flags).map(|out| {
+        const FACTOR: f64 = 332.0;
+        const EPSILON: f64 = 4.0;
+        let n_pose = translations.len();
+        (0..n_pose).map(|k| -(out[2 * k] * FACTOR / EPSILON + out[2 * k + 1])).collect()
+    })
+}
+
+#[cfg(feature = "cuda")]
+/// Two-column family batch split into per-pose (E·332/4, V) — one dispatch
+/// yields both components (CPYDOCK: score = −(E·332/4 + 0.1·V − S)).
+pub fn batch_cuda_family_parts(
+    g: &FamilyGpu,
+    field: Option<&ReceptorField>,
+    translations: &[[f64; 3]],
+    rotations: &[Quaternion],
+    flags: u32,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    cuda_family_raw(g, field, translations, rotations, flags).map(|out| {
+        const FACTOR: f64 = 332.0;
+        const EPSILON: f64 = 4.0;
+        let n_pose = translations.len();
+        let e: Vec<f64> = (0..n_pose).map(|k| out[2 * k] * FACTOR / EPSILON).collect();
+        let v: Vec<f64> = (0..n_pose).map(|k| out[2 * k + 1]).collect();
+        (e, v)
+    })
 }
 
 #[cfg(not(feature = "cuda"))]

@@ -350,8 +350,6 @@ pub struct CPYDOCK {
     solv_l: OnceLock<Option<crate::gpu_family::CpySolvSide>>,
     #[cfg(feature = "metal")]
     metal_ctx3: OnceLock<Option<crate::metal_score::MetalCtx>>,
-    #[cfg(feature = "metal")]
-    metal_ctx0: OnceLock<Option<crate::metal_score::MetalCtx>>,
 }
 
 impl CPYDOCK {
@@ -380,8 +378,6 @@ impl CPYDOCK {
             solv_l: OnceLock::new(),
             #[cfg(feature = "metal")]
             metal_ctx3: OnceLock::new(),
-            #[cfg(feature = "metal")]
-            metal_ctx0: OnceLock::new(),
         })
     }
 }
@@ -748,28 +744,17 @@ impl Score for CPYDOCK {
                             sl,
                         )
                     });
-                    let c0 = self.metal_ctx0.get_or_init(|| {
-                        crate::metal_score::MetalCtx::create_family(
-                            g,
-                            None,
-                            crate::metal_score::METAL_TG,
-                            crate::gpu_family::family_flags("vdw"),
-                        )
-                    });
-                    if let (Some(c3), Some(c0)) = (c3.as_ref(), c0.as_ref()) {
+                    if let Some(c3) = c3.as_ref() {
                         let done = (|| {
-                            let t3 = crate::metal_score::batch_metal_family_scores(
+                            let (e, v) = crate::metal_score::batch_metal_family_parts(
                                 c3, &self.ligand.coordinates, translations, rotations,
-                            )?;
-                            let v0 = crate::metal_score::batch_metal_family_scores(
-                                c0, &self.ligand.coordinates, translations, rotations,
                             )?;
                             let s = crate::metal_score::batch_metal_cpydock_solv(
                                 c3, &self.ligand.coordinates, translations, rotations,
                             )?;
                             Some(
-                                t3.iter().zip(v0.iter()).zip(s.iter())
-                                    .map(|((t, v), s)| t - 0.9 * v + s)
+                                e.iter().zip(v.iter()).zip(s.iter())
+                                    .map(|((e, v), s)| -(e + 0.1 * v) + s)
                                     .collect::<Vec<f64>>(),
                             )
                         })();
@@ -786,32 +771,24 @@ impl Score for CPYDOCK {
                             &self.receptor.ele_charges,
                         )
                     });
-                    if let Some(t3) = crate::gpu_family::batch_cuda_family(
+                    if let Some((e, v)) = crate::gpu_family::batch_cuda_family_parts(
                         g, Some(field), translations, rotations,
                         crate::gpu_family::family_flags("pydock"),
                     ) {
-                        if let Some(v0) = crate::gpu_family::batch_cuda_family(
-                            g, None, translations, rotations,
-                            crate::gpu_family::family_flags("vdw"),
+                        if let Some(s) = crate::gpu_family::batch_cuda_cpydock_solv(
+                            g, Some(field), sr, sl, translations, rotations,
                         ) {
-                            if let Some(s) = crate::gpu_family::batch_cuda_cpydock_solv(
-                                g, Some(field), sr, sl, translations, rotations,
-                            ) {
-                                use std::sync::atomic::{AtomicBool, Ordering};
-                                static LOGGED: AtomicBool = AtomicBool::new(false);
-                                if !LOGGED.swap(true, Ordering::Relaxed) {
-                                    eprintln!(
-                                        "[gpu_family] CUDA CPYDOCK BATCH + desolv ACTIVE ({} poses)",
-                                        translations.len()
-                                    );
-                                }
-                                return t3
-                                    .iter()
-                                    .zip(v0.iter())
-                                    .zip(s.iter())
-                                    .map(|((t, v), s)| t - 0.9 * v + s)
-                                    .collect();
+                            use std::sync::atomic::{AtomicBool, Ordering};
+                            static LOGGED: AtomicBool = AtomicBool::new(false);
+                            if !LOGGED.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "[gpu_family] CUDA CPYDOCK BATCH + desolv ACTIVE ({} poses)",
+                                    translations.len()
+                                );
                             }
+                            return e.iter().zip(v.iter()).zip(s.iter())
+                                .map(|((e, v), s)| -(e + 0.1 * v) + s)
+                                .collect();
                         }
                     }
                 }
