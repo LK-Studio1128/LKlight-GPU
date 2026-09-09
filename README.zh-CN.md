@@ -1,6 +1,6 @@
 # LKlight-GPU
 
-**LKlight GPU（CUDA）版（v1.2.0）** —— 全功能分子对接引擎，**Windows 与 Linux +
+**LKlight GPU版（v1.2.2，CUDA + Metal 双后端）** —— 全功能分子对接引擎，**Windows 与 Linux +
 NVIDIA 驱动即用**；无 GPU 时自动回退 CPU 网格路径，功能与 `../LKlight-grid` 完全等价。
 
 LKlight 是 Python LightDock（GSO 群智能对接）的 Rust 高性能实现；本目录是 **CUDA
@@ -15,8 +15,7 @@ Linux 版在 RTX 3080 Ti 实测。**
 
 - **评分函数 12 族**：dfire / dfire2 / dna / ddna / mj3h / pydock / cpydock / sd /
   pisa / sipper / tobi / vdw（全命令统一入口）
-- **GPU 覆盖**：`dna` 无约束/无膜/无 ANM 时走 **GPU 批量 kernel**（近距+远距一次
-  launch，device 端 f64 刚体变换）；`vdw/pydock/cpydock` 走 CPU 网格（其静电/LJ
+- **GPU 覆盖（全部四个全原子族，CUDA + Metal 双后端）**：`dna`/`vdw`/`pydock`/`cpydock` 走按族参数化的批量 kernel（族标志字选择远场/静电/clash 项）；`cpydock` 另含两阶段接触-SASA 去溶剂化 kernel；restraints/膜/ANM 走 CPU 网格路径；其余 8 个查表/统计势族本身亚秒级，走（逐字节一致的）CPU 网格路径；
   已网格化，12–48×）；
 - **自动回退（同一二进制，无需配置）**：无 NVIDIA 驱动 → CPU 网格；ANM /
   restraints / 膜 → CPU 网格路径（GPU kernel 不返回界面标记，回退保证约束语义正确，
@@ -38,7 +37,7 @@ Linux 版在 RTX 3080 Ti 实测。**
 # 没有该行 → CPU 网格模式（结果等价，仅速度不同）
 ```
 
-> macOS（Apple Silicon）无 NVIDIA 硬件，使用 CPU 网格版（见 `../LKlight-grid`）。
+> macOS（Apple Silicon）使用 **Metal 后端**（v1.2.1 起，`--features metal` 构建；`dna` best 与 NVIDIA CUDA 逐位一致）；无兼容 GPU 时自动回退 CPU 网格。
 > Windows CUDA 版需在 Windows + NVIDIA 驱动机器上运行；源码 `--features cuda`
 > 支持任意平台构建，前提是本机有对应平台 nvcc + MSVC/VC 环境。
 

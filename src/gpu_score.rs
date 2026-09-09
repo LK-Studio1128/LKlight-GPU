@@ -10,6 +10,16 @@ use crate::dna::{DNA, DNADockingModel};
 use crate::grid_dna::{ReceptorField, CLOSE_DIST};
 use crate::qt::Quaternion;
 
+// Per-family batched-kernel flags (mirror of full_score.cu; the LJ term is
+// always on). DNA = FAR|ELEC|CLASH, PYDOCK = FAR|ELEC, VDW = 0 (LJ only).
+pub const F_FAR: u32 = 1;
+pub const F_ELEC: u32 = 2;
+pub const F_CLASH: u32 = 4;
+pub const FLAGS_DNA: u32 = F_FAR | F_ELEC | F_CLASH;
+pub const FLAGS_PYDOCK: u32 = F_FAR | F_ELEC;
+pub const FLAGS_VDW: u32 = 0;
+pub const F_DESOLV: u32 = 16;  // CPYDOCK contact-SASA desolvation (two-stage kernels)
+
 /// GPU-ready ligand parameter arrays. Built once and cached on [`crate::dna::DNA`]
 /// so the host pointers stay stable across GSO steps: the CUDA persistent-buffer
 /// cache keys on the ligand-base pointer + nl, so rebuilding these Vecs per call
@@ -246,7 +256,8 @@ pub fn batch_energy_gpu_scores(
             cell_start: *const i32, cell_atoms: *const i32,
             ncx: i32, ncy: i32, ncz: i32, c_ox: f32, c_oy: f32, c_oz: f32, c_sp: f32,
             l_base: *const f32, poses: *const f64, l_ele: *const f32, l_svdw: *const f32,
-            l_vdwr: *const f32, l_heavy: *const u8, nl: i32, n_pose: i32, out: *mut f64,
+            l_vdwr: *const f32, l_heavy: *const u8, nl: i32, n_pose: i32, flags: u32,
+            out: *mut f64,
         ) -> i32;
     }
     let n_pose = translations.len();
@@ -300,7 +311,7 @@ pub fn batch_energy_gpu_scores(
             crec.cell_start.as_ptr(), crec.cell_atoms.as_ptr(),
             crec.ncx, crec.ncy, crec.ncz, crec.c_ox, crec.c_oy, crec.c_oz, crec.c_sp,
             base.as_ptr(), poses.as_ptr(), le.as_ptr(), lsv.as_ptr(), lv.as_ptr(), lh.as_ptr(),
-            nl as i32, n_pose as i32, out.as_mut_ptr(),
+            nl as i32, n_pose as i32, FLAGS_DNA, out.as_mut_ptr(),
         )
     };
     if ret != 0 {

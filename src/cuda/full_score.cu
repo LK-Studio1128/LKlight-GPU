@@ -18,6 +18,12 @@
 #define CP_F   0.75f
 #define ES_CAP 0.01204819f   // 1.0*EPSILON/FACTOR with EPSILON=4, FACTOR=332
 
+// Per-family kernel flags (the LJ term is always on: every all-atom family
+// scores it). DNA = FAR|ELEC|CLASH (7), PYDOCK = FAR|ELEC (3), VDW = 0 (LJ only).
+#define F_FAR   1u
+#define F_ELEC  2u
+#define F_CLASH 4u
+
 __device__ __forceinline__ float sample_phi_f(
     const float* __restrict__ phi, int nx, int ny, int nz,
     float ox, float oy, float oz, float sp,
@@ -225,6 +231,7 @@ __global__ void batch_full_score_kernel(
     const float* __restrict__ l_ele, const float* __restrict__ l_svdw,
     const float* __restrict__ l_vdwr, const unsigned char* __restrict__ l_heavy,
     int nl, int N,
+    unsigned flags,
     double* __restrict__ out)                 // N * 2  (elec, vdw)
 {
     int pose = blockIdx.y;
@@ -264,7 +271,7 @@ __global__ void batch_full_score_kernel(
     float vdwrj = l_vdwr[j];
     bool hj = l_heavy[j] != 0;
     float elec = 0.f, vdw = 0.f;
-    if (qj != 0.f)
+    if ((flags & F_FAR) && qj != 0.f)
         elec += qj * sample_phi_f(phi, nx, ny, nz, ox, oy, oz, sp, x, y, z);
     int cxi = (int)floorf((x - c_ox) / c_sp);
     int cyi = (int)floorf((y - c_oy) / c_sp);
@@ -287,17 +294,19 @@ __global__ void batch_full_score_kernel(
                     float dzf = z - r_coords[i*3+2];
                     float d2 = dxf*dxf + dyf*dyf + dzf*dzf;
                     if (d2 <= NEAR2) {
-                        float ae = qj * r_ele[i] / d2;
-                        if (ae > ES_CAP) ae = ES_CAP;
-                        else if (ae < -ES_CAP) ae = -ES_CAP;
-                        elec += ae;
+                        if (flags & F_ELEC) {
+                            float ae = qj * r_ele[i] / d2;
+                            if (ae > ES_CAP) ae = ES_CAP;
+                            else if (ae < -ES_CAP) ae = -ES_CAP;
+                            elec += ae;
+                        }
                         float sv = svdwj * r_svdw[i];
                         float rr = vdwrj + r_vdwr[i];
                         float rr2 = rr * rr;
                         float p6 = rr2 * rr2 * rr2 / (d2 * d2 * d2);
                         float vp = sv * (p6*p6 - 2.0f*p6);
                         if (vp > LJ_CAP) vp = LJ_CAP;
-                        if (hj && r_heavy[i]) {
+                        if ((flags & F_CLASH) && hj && r_heavy[i]) {
                             float d = sqrtf(d2);
                             float dmin = CP_F * rr;
                             if (d < dmin) vp += CP_W * (dmin - d);
@@ -343,6 +352,7 @@ typedef struct { int live; float* phi; float* rc; float* re; float* rsv;
                  float* lb; float* le; float* lsv; float* lv; unsigned char* lh;
                  double* out;
                  unsigned long long key_phi, key_rc, key_cs, key_lb, key_nl;
+                 unsigned flags;
                  int n_phi, n_rc, n_cs, n_lb, n_l; } BatchCache;
 static BatchCache g_bc = {0};
 
@@ -357,6 +367,7 @@ extern "C" int cuda_batch_score(
     const float* l_base, const double* poses, const float* l_ele,
     const float* l_svdw, const float* l_vdwr, const unsigned char* l_heavy,
     int nl, int N,
+    unsigned flags,
     double* out)
 {
     cudaError_t err;
@@ -373,7 +384,7 @@ extern "C" int cuda_batch_score(
     int nl_k = nl;
     int fresh = !(g_bc.live &&
                   g_bc.key_phi==k_phi && g_bc.key_rc==k_rc && g_bc.key_cs==k_cs &&
-                  g_bc.key_lb==k_lb && g_bc.n_l==nl_k);
+                  g_bc.key_lb==k_lb && g_bc.n_l==nl_k && g_bc.flags==flags);
 
     if (fresh) {
         // release any previous receptor's cached buffers
@@ -413,7 +424,7 @@ extern "C" int cuda_batch_score(
         CK(cudaMemcpy(g_bc.lv,l_vdwr,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
         CK(cudaMemcpy(g_bc.lh,l_heavy,(size_t)nl,cudaMemcpyHostToDevice));
         g_bc.key_phi=k_phi; g_bc.key_rc=k_rc; g_bc.key_cs=k_cs;
-        g_bc.key_lb=k_lb;   g_bc.n_l=nl_k;    g_bc.live=1;
+        g_bc.key_lb=k_lb;   g_bc.n_l=nl_k;    g_bc.flags=flags; g_bc.live=1;
 #undef CK
     }
 
@@ -436,7 +447,7 @@ extern "C" int cuda_batch_score(
             g_bc.phi,nx,ny,nz,ox,oy,oz,sp,
             g_bc.rc,g_bc.re,g_bc.rsv,g_bc.rv,g_bc.rh,g_bc.cs,g_bc.ca,
             ncx,ncy,ncz,c_ox,c_oy,c_oz,c_sp,
-            g_bc.lb,d_ps,g_bc.le,g_bc.lsv,g_bc.lv,g_bc.lh,nl,N,g_bc.out);
+            g_bc.lb,d_ps,g_bc.le,g_bc.lsv,g_bc.lv,g_bc.lh,nl,N,flags,g_bc.out);
         err = cudaGetLastError();          // launch-config errors surface here
         if (err != cudaSuccess) { cudaFree(d_ps); goto fail; }
         stage = 5;
@@ -452,4 +463,210 @@ fail:
     { const char* m=cudaGetErrorString(err); fprintf(stderr,"cuda_batch_score error stage=%d N=%d nl=%d err=%d(%s)\n",stage,N,nl,(int)err,m); }
     if (d_ps) cudaFree(d_ps);
     return -1;
+}
+
+// ── CPYDOCK desolvation (two-stage) ──────────────────────────────────────────
+// Stage A collects, per pose, the minimum squared distance to an opposite-side
+// atom over "non-excluded" pairs — CPYDOCK's C-binary-compatible exclusion is
+// flag(i) = (i even) && hydrogens[i/2]!=0 — for every receptor atom i
+// (device-wide atomic float-min on the integer bits of d2>0, which preserves
+// order) and every ligand atom j (thread-private, single writer). Stage B
+// reduces the per-pose desolvation S = Σ g(min)·des over receptor + ligand,
+// where g(d2) = d2<=SOLV2 && d2>0 && asa>0 ? min(-10·√d2+65, asa) : 0.
+// The host combines score = -(E·332/4 + 0.1·V − S).
+__global__ void cpydock_min_kernel(
+    const float* __restrict__ r_coords, const unsigned char* __restrict__ r_flag,
+    const int* __restrict__ cell_start, const int* __restrict__ cell_atoms,
+    int ncx, int ncy, int ncz, float c_ox, float c_oy, float c_oz, float c_sp,
+    const float* __restrict__ l_base, const double* __restrict__ poses,
+    const unsigned char* __restrict__ l_flag, int nr, int nl, int N,
+    int* __restrict__ dminR, float* __restrict__ dminL)
+{
+    int pose = blockIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= nl) return;
+    const double* pq = poses + (size_t)pose * 7;
+    double w = pq[0], qx = pq[1], qy = pq[2], qz = pq[3];
+    double tx = pq[4], ty = pq[5], tz = pq[6];
+    const float* lb = l_base + (size_t)j * 3;
+    double vx = lb[0], vy = lb[1], vz = lb[2];
+    double m00 = 1. - 2.*(qy*qy+qz*qz), m01 = 2.*(qx*qy - w*qz),  m02 = 2.*(qx*qz + w*qy);
+    double m10 = 2.*(qx*qy + w*qz),      m11 = 1. - 2.*(qx*qx+qz*qz), m12 = 2.*(qy*qz - w*qx);
+    double m20 = 2.*(qx*qz - w*qy),      m21 = 2.*(qy*qz + w*qx),  m22 = 1. - 2.*(qx*qx+qy*qy);
+    float x = (float)(m00*vx + m01*vy + m02*vz + tx);
+    float y = (float)(m10*vx + m11*vy + m12*vz + ty);
+    float z = (float)(m20*vx + m21*vy + m22*vz + tz);
+    bool lf = l_flag[j] != 0;
+    float minL = 3.4e38f;
+    int cxi = (int)floorf((x - c_ox) / c_sp);
+    int cyi = (int)floorf((y - c_oy) / c_sp);
+    int czi = (int)floorf((z - c_oz) / c_sp);
+    for (int dz = -1; dz <= 1; ++dz) {
+        int czz = czi + dz;
+        if (czz < 0 || czz >= ncz) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            int cyy = cyi + dy;
+            if (cyy < 0 || cyy >= ncy) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                int cxx = cxi + dx;
+                if (cxx < 0 || cxx >= ncx) continue;
+                int cell = (czz * ncy + cyy) * ncx + cxx;
+                int b = cell_start[cell], e = cell_start[cell + 1];
+                for (int p = b; p < e; ++p) {
+                    int i = cell_atoms[p];
+                    float dxf = x - r_coords[i*3];
+                    float dyf = y - r_coords[i*3+1];
+                    float dzf = z - r_coords[i*3+2];
+                    float d2 = dxf*dxf + dyf*dyf + dzf*dzf;
+                    if (!lf && r_flag[i] == 0 && d2 < minL) {
+                        minL = d2;   // ligand-atom private minimum
+                    }
+                    if (!lf && r_flag[i] == 0) {
+                        // receptor-atom minimum: int-ordered atomic min (d2>0)
+                        atomicMin(&dminR[(size_t)pose * nr + i], __float_as_int(d2));
+                    }
+                }
+            }
+        }
+    }
+    dminL[(size_t)pose * nl + j] = minL;
+}
+
+__global__ void cpydock_solv_kernel(
+    const int* __restrict__ dminR, const float* __restrict__ dminL,
+    const float* __restrict__ r_asa, const float* __restrict__ r_des,
+    const float* __restrict__ l_asa, const float* __restrict__ l_des,
+    int nr, int nl, int N,
+    double* __restrict__ outS)
+{
+    int pose = blockIdx.y;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ float sm[];
+    float acc = 0.f;
+    for (int i = tid; i < nr; i += gridDim.x * blockDim.x) {
+        float d2 = __int_as_float(dminR[(size_t)pose * nr + i]);
+        if (d2 <= 40.96f && d2 > 0.f && r_asa[i] > 0.f) {
+            float sv = -10.f * sqrtf(d2) + 65.f;
+            if (sv > r_asa[i]) sv = r_asa[i];
+            acc += sv * r_des[i];
+        }
+    }
+    for (int j = tid; j < nl; j += gridDim.x * blockDim.x) {
+        float d2 = dminL[(size_t)pose * nl + j];
+        if (d2 <= 40.96f && d2 > 0.f && l_asa[j] > 0.f) {
+            float sv = -10.f * sqrtf(d2) + 65.f;
+            if (sv > l_asa[j]) sv = l_asa[j];
+            acc += sv * l_des[j];
+        }
+    }
+    sm[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&outS[pose], (double)sm[0]);
+}
+
+extern "C" int cuda_cpydock_solv(
+    const float* r_coords, const unsigned char* r_flag, int nr,
+    const int* cell_start, const int* cell_atoms,
+    int ncx, int ncy, int ncz,
+    float c_ox, float c_oy, float c_oz, float c_sp,
+    const float* l_base, const double* poses,
+    const unsigned char* l_flag, const float* l_ele, int nl,
+    int N,
+    const float* r_des, const float* r_asa,
+    const float* l_des, const float* l_asa,
+    double* outS)
+{
+    // Persistent device cache for the constant arrays (receptor cell/params +
+    // ligand base + desolvation arrays) and the per-pose scratch buffers.
+    static float *d_rc = 0, *d_lb = 0, *d_rd = 0, *d_ra = 0, *d_ld = 0, *d_la = 0;
+    static unsigned char *d_rf = 0, *d_lf = 0;
+    static int *d_cs = 0, *d_ca = 0;
+    static int *dminR = 0; static float *dminL = 0;
+    static double *d_out = 0;
+    static int cap_nr = 0, cap_nl = 0, cap_N = 0;
+    cudaError_t err; int st = 0;
+    double *d_ps = 0;
+#define CK(expr) do { err=(expr); if(err!=cudaSuccess) goto fail; } while(0)
+    if (nr != cap_nr || nl != cap_nl) {
+        if (cap_nr) {
+            cudaFree(d_rc); cudaFree(d_rf); cudaFree(d_cs); cudaFree(d_ca);
+            cudaFree(d_rd); cudaFree(d_ra); cudaFree(d_lb); cudaFree(d_lf);
+            cudaFree(d_ld); cudaFree(d_la); cudaFree(dminR); cudaFree(dminL); cudaFree(d_out);
+        }
+        st = 10;
+        CK(cudaMalloc(&d_rc,(size_t)nr*3*sizeof(float)));
+        CK(cudaMalloc(&d_rf,(size_t)nr));
+        size_t csb=(size_t)((ncx+1)*(ncy+1)*(ncz+1)+1)*sizeof(int);
+        CK(cudaMalloc(&d_cs,csb));
+        CK(cudaMalloc(&d_ca,(size_t)nr*sizeof(int)));
+        CK(cudaMalloc(&d_rd,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&d_ra,(size_t)nr*sizeof(float)));
+        CK(cudaMalloc(&d_lb,(size_t)nl*3*sizeof(float)));
+        CK(cudaMalloc(&d_lf,(size_t)nl));
+        CK(cudaMalloc(&d_ld,(size_t)nl*sizeof(float)));
+        CK(cudaMalloc(&d_la,(size_t)nl*sizeof(float)));
+        CK(cudaMemcpy(d_rc,r_coords,(size_t)nr*3*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_rf,r_flag,(size_t)nr,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_cs,cell_start,csb,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ca,cell_atoms,(size_t)nr*sizeof(int),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_rd,r_des,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ra,r_asa,(size_t)nr*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_lb,l_base,(size_t)nl*3*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_lf,l_flag,(size_t)nl,cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ld,l_des,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_la,l_asa,(size_t)nl*sizeof(float),cudaMemcpyHostToDevice));
+        cap_nr=nr; cap_nl=nl;
+    }
+    if (N > cap_N) {
+        if (cap_N) { cudaFree(dminR); cudaFree(dminL); cudaFree(d_out); }
+        CK(cudaMalloc(&dminR,(size_t)N*nr*sizeof(int)));
+        CK(cudaMalloc(&dminL,(size_t)N*nl*sizeof(float)));
+        CK(cudaMalloc(&d_out,(size_t)N*sizeof(double)));
+        cap_N=N;
+    }
+    // per-step pose upload (small)
+    CK(cudaMalloc(&d_ps,(size_t)N*7*sizeof(double)));
+    CK(cudaMemcpy(d_ps,poses,(size_t)N*7*sizeof(double),cudaMemcpyHostToDevice));
+    // Stage A: min collection (device atomics; int-ordered on d2>0 bits)
+    st = 13;
+    CK(cudaMemset(dminR, 0x7F, (size_t)N*nr*sizeof(int)));
+    {
+        int threads = 256;
+        int bx = (nl + threads - 1) / threads;
+        dim3 grid(bx, N);
+        cpydock_min_kernel<<<grid, threads>>>(
+            d_rc, d_rf, d_cs, d_ca, ncx, ncy, ncz, c_ox, c_oy, c_oz, c_sp,
+            d_lb, d_ps, d_lf, nr, nl, N, dminR, dminL);
+        st = 14;
+        CK(cudaGetLastError());
+    }
+    st = 15;
+    CK(cudaDeviceSynchronize());
+    // Stage B: desolvation reduce
+    st = 16;
+    CK(cudaMemset(d_out, 0, (size_t)N*sizeof(double)));
+    {
+        int threads = 256;
+        int bx = (nr + nl + threads - 1) / threads;
+        if (bx < 8) bx = 8; if (bx > 64) bx = 64;
+        dim3 grid(bx, N);
+        cpydock_solv_kernel<<<grid, threads, threads*sizeof(float)>>>(
+            dminR, dminL, d_ra, d_rd, d_la, d_ld, nr, nl, N, d_out);
+        st = 17;
+        CK(cudaGetLastError());
+    }
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(outS, d_out, (size_t)N*sizeof(double), cudaMemcpyDeviceToHost));
+    cudaFree(d_ps);
+    return 0;
+fail:
+    { const char* m=cudaGetErrorString(err);
+      fprintf(stderr,"cuda_cpydock_solv error stage=%d N=%d nr=%d nl=%d: %s\n", st, N, nr, nl, m); }
+    if (d_ps) cudaFree(d_ps);
+    return -1;
+
 }

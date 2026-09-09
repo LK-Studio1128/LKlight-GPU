@@ -344,6 +344,12 @@ pub struct CPYDOCK {
     pub use_anm: bool,
     cells: OnceLock<NearCells>,
     field: OnceLock<ReceptorField>,
+    gpu_state: OnceLock<bool>,
+    gpu: OnceLock<Option<crate::gpu_family::FamilyGpu>>,
+    solv_r: OnceLock<Option<crate::gpu_family::CpySolvSide>>,
+    solv_l: OnceLock<Option<crate::gpu_family::CpySolvSide>>,
+    #[cfg(feature = "metal")]
+    metal_ctx3: OnceLock<Option<crate::metal_score::MetalCtx>>,
 }
 
 impl CPYDOCK {
@@ -366,6 +372,12 @@ impl CPYDOCK {
             use_anm,
             cells: OnceLock::new(),
             field: OnceLock::new(),
+            gpu_state: OnceLock::new(),
+            gpu: OnceLock::new(),
+            solv_r: OnceLock::new(),
+            solv_l: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx3: OnceLock::new(),
         })
     }
 }
@@ -674,8 +686,137 @@ impl Score for CPYDOCK {
     ) -> f64 {
         self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
     }
+
+    fn supports_batch(&self) -> bool {
+        if self.use_anm {
+            return false;
+        }
+        if !self.receptor.active_restraints.is_empty()
+            || !self.ligand.active_restraints.is_empty()
+            || !self.receptor.membrane.is_empty()
+            || !self.ligand.membrane.is_empty()
+        {
+            return false;
+        }
+        *self.gpu_state.get_or_init(crate::gpu_family::family_batch_available)
+    }
+
+    fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        // score = -(E·332/4 + 0.1·V − S). Computed from GPU components as
+        //   T  = flags3 batch → -(E·332/4 + V)
+        //   v0 = flags0 batch (LJ only) → -V
+        //   ⇒ cp = T − 0.9·v0 + S = T + 0.9·V + S
+        // The per-model GPU dataset, the desolvation sides and the far field
+        // are shared by the CUDA and Metal branches below.
+        if !self.use_anm {
+            let cached = self.gpu.get_or_init(|| {
+                Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
+            });
+            let sr = self.solv_r.get_or_init(|| {
+                Some(crate::gpu_family::CpySolvSide {
+                    flag: cpy_flag(&self.receptor.hydrogens, self.receptor.coordinates.len()),
+                    des: self.receptor.des_energy.iter().map(|&x| x as f32).collect(),
+                    asa: self.receptor.asa.iter().map(|&x| x as f32).collect(),
+                })
+            });
+            let sl = self.solv_l.get_or_init(|| {
+                Some(crate::gpu_family::CpySolvSide {
+                    flag: cpy_flag(&self.ligand.hydrogens, self.ligand.coordinates.len()),
+                    des: self.ligand.des_energy.iter().map(|&x| x as f32).collect(),
+                    asa: self.ligand.asa.iter().map(|&x| x as f32).collect(),
+                })
+            });
+            if let (Some(g), Some(sr), Some(sl)) = (cached.as_ref(), sr.as_ref(), sl.as_ref()) {
+                #[cfg(feature = "metal")]
+                {
+                    let field = self.field.get_or_init(|| {
+                        ReceptorField::build(
+                            &self.receptor.coordinates,
+                            &self.receptor.ele_charges,
+                        )
+                    });
+                    let c3 = self.metal_ctx3.get_or_init(|| {
+                        crate::metal_score::MetalCtx::create_cpydock(
+                            g,
+                            Some(field),
+                            crate::metal_score::METAL_TG,
+                            sr,
+                            sl,
+                        )
+                    });
+                    if let Some(c3) = c3.as_ref() {
+                        let done = (|| {
+                            let (e, v) = crate::metal_score::batch_metal_family_parts(
+                                c3, &self.ligand.coordinates, translations, rotations,
+                            )?;
+                            let s = crate::metal_score::batch_metal_cpydock_solv(
+                                c3, &self.ligand.coordinates, translations, rotations,
+                            )?;
+                            Some(
+                                e.iter().zip(v.iter()).zip(s.iter())
+                                    .map(|((e, v), s)| -(e + 0.1 * v) + s)
+                                    .collect::<Vec<f64>>(),
+                            )
+                        })();
+                        if let Some(scores) = done {
+                            return scores;
+                        }
+                    }
+                }
+                #[cfg(feature = "cuda")]
+                {
+                    let field = self.field.get_or_init(|| {
+                        ReceptorField::build(
+                            &self.receptor.coordinates,
+                            &self.receptor.ele_charges,
+                        )
+                    });
+                    if let Some((e, v)) = crate::gpu_family::batch_cuda_family_parts(
+                        g, Some(field), translations, rotations,
+                        crate::gpu_family::family_flags("pydock"),
+                    ) {
+                        if let Some(s) = crate::gpu_family::batch_cuda_cpydock_solv(
+                            g, Some(field), sr, sl, translations, rotations,
+                        ) {
+                            use std::sync::atomic::{AtomicBool, Ordering};
+                            static LOGGED: AtomicBool = AtomicBool::new(false);
+                            if !LOGGED.swap(true, Ordering::Relaxed) {
+                                eprintln!(
+                                    "[gpu_family] CUDA CPYDOCK BATCH + desolv ACTIVE ({} poses)",
+                                    translations.len()
+                                );
+                            }
+                            return e.iter().zip(v.iter()).zip(s.iter())
+                                .map(|((e, v), s)| -(e + 0.1 * v) + s)
+                                .collect();
+                        }
+                    }
+                }
+            }
+        }
+        translations
+            .iter()
+            .zip(rotations.iter())
+            .map(|(t, r)| self.energy_grid(t, r, &[], &[]))
+            .collect()
+    }
 }
 
+/// C-binary-compatible desolvation exclusion mask: flag(i) = 1 iff i is even
+/// AND hydrogens[i/2] != 0 (see CPYDOCKDockingModel::hydrogens; odd indices
+/// are never excluded).
+fn cpy_flag(hydrogens: &[i32], n_atoms: usize) -> Vec<u8> {
+    // C-binary view: flag(i) = 1 iff i is even AND hydrogens[i/2] != 0.
+    // hydrogens.len() == coordinates.len() == n_atoms (one entry per atom);
+    // only indices < n_atoms are addressed.
+    let mut flag = vec![0u8; n_atoms];
+    for (i, f) in flag.iter_mut().enumerate() {
+        if i % 2 == 0 && hydrogens[i / 2] != 0 {
+            *f = 1;
+        }
+    }
+    flag
+}
 
 #[cfg(test)]
 mod tests {

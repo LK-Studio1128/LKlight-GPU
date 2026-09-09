@@ -18,6 +18,13 @@ pub struct VDW {
     /// Receptor cell list (10 Å cells) built once for the grid-accelerated
     /// path. Receptor is rigid (non-ANM) so it is valid for the whole run.
     cells: OnceLock<NearCells>,
+    /// Family-GPU batch state: accelerator availability (probed once) and the
+    /// cached GPU-ready dataset (stable host pointers, required by the CUDA
+    /// persistent-buffer cache).
+    gpu_state: OnceLock<bool>,
+    gpu: OnceLock<Option<crate::gpu_family::FamilyGpu>>,
+    #[cfg(feature = "metal")]
+    metal_ctx: OnceLock<Option<crate::metal_score::MetalCtx>>,
 }
 
 impl<'a> VDW {
@@ -51,6 +58,10 @@ impl<'a> VDW {
             ),
             use_anm,
             cells: OnceLock::new(),
+            gpu_state: OnceLock::new(),
+            gpu: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx: OnceLock::new(),
         };
         Box::new(d)
     }
@@ -247,6 +258,73 @@ impl Score for VDW {
     ) -> f64 {
         self.energy_grid(translation, rotation, rec_nmodes, lig_nmodes)
     }
+
+    fn supports_batch(&self) -> bool {
+        if self.use_anm {
+            return false;
+        }
+        // Restraints / membrane need per-atom interface flags which the GPU
+        // batch kernel does not compute; keep those runs on the CPU grid path.
+        if !self.receptor.active_restraints.is_empty()
+            || !self.ligand.active_restraints.is_empty()
+            || !self.receptor.membrane.is_empty()
+            || !self.ligand.membrane.is_empty()
+        {
+            return false;
+        }
+        *self.gpu_state.get_or_init(crate::gpu_family::family_batch_available)
+    }
+
+    fn batch_energy(&self, translations: &[[f64; 3]], rotations: &[Quaternion]) -> Vec<f64> {
+        #[cfg(feature = "metal")]
+        if !self.use_anm {
+            let cached = self.gpu.get_or_init(|| {
+                Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
+            });
+            if let Some(g) = cached.as_ref() {
+                let ctx = self.metal_ctx.get_or_init(|| {
+                    crate::metal_score::MetalCtx::create_family(
+                        g,
+                        None, // VDW: no far field
+                        crate::metal_score::METAL_TG,
+                        crate::gpu_family::family_flags("vdw"),
+                    )
+                });
+                if let Some(c) = ctx.as_ref() {
+                    if let Some(scores) = crate::metal_score::batch_metal_family_scores(
+                        c,
+                        &self.ligand.coordinates,
+                        translations,
+                        rotations,
+                    ) {
+                        return scores;
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "cuda")]
+        if !self.use_anm {
+            let cached = self.gpu.get_or_init(|| {
+                Some(crate::gpu_family::build_family(&self.receptor, &self.ligand))
+            });
+            if let Some(g) = cached.as_ref() {
+                if let Some(scores) = crate::gpu_family::batch_cuda_family(
+                    g,
+                    None, // VDW has no far field (flags clear F_FAR)
+                    translations,
+                    rotations,
+                    crate::gpu_family::family_flags("vdw"),
+                ) {
+                    return scores;
+                }
+            }
+        }
+        translations
+            .iter()
+            .zip(rotations.iter())
+            .map(|(t, r)| self.energy_grid(t, r, &[], &[]))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +358,10 @@ mod tests {
             ligand: lig,
             use_anm: false,
             cells: OnceLock::new(),
+            gpu_state: OnceLock::new(),
+            gpu: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx: OnceLock::new(),
         };
         let t = vec![0., 0., 0.];
         let q = Quaternion::default();

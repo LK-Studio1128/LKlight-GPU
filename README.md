@@ -1,8 +1,9 @@
 # LKlight-GPU
 
-**CUDA-batched docking engine — LKlight-GPU v1.2.0.** Full-featured molecular
+**GPU-batched docking engine — LKlight-GPU v1.2.2.** Full-featured molecular
 docking for protein–nucleic-acid and protein–protein complexes with
-**NVIDIA-GPU batching on Windows and Linux**. No GPU present? The same binary
+**NVIDIA-GPU (CUDA) batching on Windows and Linux and Apple-GPU (Metal)
+batching on Apple Silicon**. No compatible GPU present? The same binary
 silently falls back to the CPU grid path (functionally identical to
 `LKlight-grid`).
 
@@ -15,8 +16,10 @@ far-field in a single launch, batched over **all poses of the whole GSO step**
 (gridDim.y = pose count), with the rigid-body coordinate transform done on the
 device (only N×7 pose parameters are uploaded per step instead of every atom).
 
-Both GPU binaries were built **and verified on real machines**: Windows CUDA on
-an RTX 2080 (`CUDA BATCH ACTIVE`), Linux CUDA on an RTX 3080 Ti.
+The GPU binaries are built **and verified on real machines**: Windows CUDA on
+an RTX 2080 and an RTX 3080 Ti (`CUDA BATCH ACTIVE`, 1,000 × 1,000 acceptance),
+Linux CUDA on an RTX 3080 Ti, and the Metal backend on a Mac mini M4 (best
+energies bit-identical to the NVIDIA backend for `dna`).
 
 ---
 
@@ -25,9 +28,13 @@ an RTX 2080 (`CUDA BATCH ACTIVE`), Linux CUDA on an RTX 3080 Ti.
 - **12 scoring functions** behind one `Score` trait, identical surface to the
   CPU build: `dfire`, `dfire2`, `dna`, `ddna`, `mj3h`, `pydock`, `cpydock`,
   `sd`, `pisa`, `sipper`, `tobi`, `vdw`.
-- **GPU coverage**: `dna` (no restraints/membrane/ANM) uses the **CUDA batch
-  kernel**; `vdw` / `pydock` / `cpydock` use the CPU grid path (already
-  grid-accelerated 12–48×).
+- **GPU coverage (all four all-atom families, both backends)**: `dna`,
+  `vdw`, `pydock` and `cpydock` run on the family-parameterised batch kernel
+  (per-family flag word: dna = far+elec+clash, pydock = far+elec, vdw = LJ
+  only); `cpydock` adds a two-stage contact-SASA desolvation kernel
+  (per-pose atomic-min then reduce). Restraints / membrane / ANM stay on the
+  CPU grid path. The eight remaining table/statistical-potential families are
+  already sub-second and stay on the (bit-identical) CPU grid path.
 - **Automatic fallback in one binary, zero configuration**: no NVIDIA
   driver → CPU grid; ANM / restraints / membrane → CPU grid (the GPU kernel
   does not emit interface flags; the CPU grid path collects them, so

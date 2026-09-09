@@ -14,6 +14,7 @@ pub mod glowworm;
 pub mod gpu_field;
 pub mod gpu_score;
 pub mod grid_dna;
+pub mod gpu_family;
 #[cfg(feature = "metal")]
 pub mod metal_score;
 pub mod lr_sasa;

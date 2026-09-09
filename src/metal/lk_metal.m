@@ -32,6 +32,7 @@ static const char *LK_MSL =
 "constant float CP_W = 6.0f;\n"
 "constant float CP_F = 0.75f;\n"
 "constant float ES_CAP = 0.01204819f;\n"
+"// Family flags (buffer 11 sizes[3]): LJ always on. FAR=1 ELEC=2 CLASH=4.\n"
 "inline float sample_phi(device const float* phi, int nx, int ny, int nz,\n"
 "                        float ox, float oy, float oz, float sp,\n"
 "                        float x, float y, float z) {\n"
@@ -74,6 +75,7 @@ static const char *LK_MSL =
 "    uint tg_sz [[threads_per_threadgroup]])\n"
 "{\n"
 "    const int nl = sizes[1];\n"
+"    const uint flags = (uint)sizes[3];\n"
 "    float2 elec=float2(0.f,0.f), vdw=float2(0.f,0.f);\n"
 "    for (int j=(int)lid; j<nl; j+=(int)tg_sz) {\n"
 "        const int nx=fdims[0], ny=fdims[1], nz=fdims[2];\n"
@@ -85,7 +87,7 @@ static const char *LK_MSL =
 "        float x=lc[p3], y=lc[p3+1], z=lc[p3+2];\n"
 "        float4 lq=lpp[j];\n"
 "        float qj=lq.x, svdwj=lq.y, vdwrj=lq.z; bool hj = lq.w>0.5f;\n"
-"        if (qj!=0.f) {\n"
+"        if ((flags & 1u) && qj!=0.f) {\n"
 "            float2 t=kadd(elec, qj*sample_phi(phi,nx,ny,nz,ox,oy,oz,sp,x,y,z)); elec=t;\n"
 "        }\n"
 "        int cxi=(int)floor((x-c_ox)/c_sp), cyi=(int)floor((y-c_oy)/c_sp), czi=(int)floor((z-c_oz)/c_sp);\n"
@@ -104,16 +106,18 @@ static const char *LK_MSL =
 "                        float d2=dxf*dxf+dyf*dyf+dzf*dzf;\n"
 "                        if (d2<=NEAR2) {\n"
 "                            float4 rB=rpp[i];\n"
-"                            float ae=qj*rA.w/d2;\n"
-"                            if (ae>ES_CAP) ae=ES_CAP;\n"
-"                            if (ae<-ES_CAP) ae=-ES_CAP;\n"
-"                            float2 t=kadd(elec,ae); elec=t;\n"
+"                            if (flags & 2u) {\n"
+"                                float ae=qj*rA.w/d2;\n"
+"                                if (ae>ES_CAP) ae=ES_CAP;\n"
+"                                if (ae<-ES_CAP) ae=-ES_CAP;\n"
+"                                float2 t=kadd(elec,ae); elec=t;\n"
+"                            }\n"
 "                            float sv=svdwj*rB.x;\n"
 "                            float rr=vdwrj+rB.y;\n"
 "                            float p6=(rr*rr)*(rr*rr)*(rr*rr)/(d2*d2*d2);\n"
 "                            float vp=sv*(p6*p6-2.f*p6);\n"
 "                            if (vp>LJ_CAP) vp=LJ_CAP;\n"
-"                            if (hj && rB.z>0.5f) {\n"
+"                            if ((flags & 4u) && hj && rB.z>0.5f) {\n"
 "                                float dmin=CP_F*rr;\n"
 "                                if (d2<dmin*dmin) vp+=CP_W*(dmin-sqrt(d2));\n"
 "                            }\n"
@@ -138,6 +142,98 @@ static const char *LK_MSL =
 "        }\n"
 "    }\n"
 "    if (lid==0) { outE[pose]=se[0].x+se[0].y; outV[pose]=sv[0].x+sv[0].y; }\n"
+"}\n"
+// ── CPYDOCK desolvation (two-stage). Buffers shared with batch_score:\n"
+//   rpk=3 bcs=5 bca=6 cgi=7 cgf=8 lc=9 sizes=11; extra: rflag=14 lflag=15\n"
+//   dminR(atomic int, byte-filled 0x7F per step)=16 dminL(float)=17\n"
+"kernel void cpydock_min(\n"
+"    device const float4* rpk [[buffer(3)]],\n"
+"    device const uchar* rflag [[buffer(14)]],\n"
+"    device const int* bcs [[buffer(5)]],\n"
+"    device const int* bca [[buffer(6)]],\n"
+"    constant int3& cgi [[buffer(7)]],\n"
+"    constant float4& cgf [[buffer(8)]],\n"
+"    device const float* lc [[buffer(9)]],\n"
+"    device const uchar* lflag [[buffer(15)]],\n"
+"    device const int* sizes [[buffer(11)]],\n"
+"    device atomic_int* dminR [[buffer(16)]],\n"
+"    device float* dminL [[buffer(17)]],\n"
+"    uint2 gid [[thread_position_in_grid]])\n"
+"{\n"
+"    uint nr=(uint)sizes[0], nl=(uint)sizes[1], N=(uint)sizes[2];\n"
+"    uint j=gid.x, pose=gid.y;\n"
+"    if (j>=nl || pose>=N) return;\n"
+"    device const float* p3=&lc[(pose*nl+j)*3];\n"
+"    float px=p3[0], py=p3[1], pz=p3[2];\n"
+"    bool lf = lflag[j]!=0;\n"
+"    float minL=3.4e38f;\n"
+"    int cxi=(int)floor((px-cgf.x)/cgf.w);\n"
+"    int cyi=(int)floor((py-cgf.y)/cgf.w);\n"
+"    int czi=(int)floor((pz-cgf.z)/cgf.w);\n"
+"    for (int dz=-1; dz<=1; ++dz) {\n"
+"        int czz=czi+dz; if (czz<0 || czz>=cgi.z) continue;\n"
+"        for (int dy=-1; dy<=1; ++dy) {\n"
+"            int cyy=cyi+dy; if (cyy<0 || cyy>=cgi.y) continue;\n"
+"            for (int dx=-1; dx<=1; ++dx) {\n"
+"                int cxx=cxi+dx; if (cxx<0 || cxx>=cgi.x) continue;\n"
+"                int cell=(czz*cgi.y+cyy)*cgi.x+cxx;\n"
+"                int b=bcs[cell], e=bcs[cell+1];\n"
+"                for (int q=b; q<e; ++q) {\n"
+"                    int i=bca[q];\n"
+"                    float3 rc=rpk[i].xyz;\n"
+"                    float dxf=px-rc.x, dyf=py-rc.y, dzf=pz-rc.z;\n"
+"                    float d2=dxf*dxf+dyf*dyf+dzf*dzf;\n"
+"                    if (!lf && rflag[i]==0) {\n"
+"                        if (d2<minL) minL=d2;\n"
+"                        atomic_fetch_min_explicit(&dminR[pose*nr+i],\n"
+"                                                  as_type<int>(d2), memory_order_relaxed);\n"
+"                    }\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    dminL[pose*nl+j]=minL;\n"
+"}\n"
+"kernel void cpydock_solv(\n"
+"    device const int* dminR [[buffer(0)]],\n"
+"    device const float* dminL [[buffer(1)]],\n"
+"    device const float* r_asa [[buffer(2)]],\n"
+"    device const float* r_des [[buffer(3)]],\n"
+"    device const float* l_asa [[buffer(4)]],\n"
+"    device const float* l_des [[buffer(5)]],\n"
+"    device const int* sizes [[buffer(6)]],\n"
+"    device float* S [[buffer(7)]],\n"
+"    uint2 gid [[thread_position_in_grid]],\n"
+"    uint lid [[thread_index_in_threadgroup]])\n"
+"{\n"
+"    uint nr=(uint)sizes[0], nl=(uint)sizes[1], N=(uint)sizes[2];\n"
+"    uint pose=gid.y;\n"
+"    uint tg=512u;\n"
+"    threadgroup float sm[512];\n"
+"    float acc=0.f;\n"
+"    for (uint i=lid; i<nr; i+=tg) {\n"
+"        float d2=as_type<float>(dminR[pose*nr+i]);\n"
+"        if (d2<=40.96f && d2>0.f && r_asa[i]>0.f) {\n"
+"            float sv=-10.f*sqrt(d2)+65.f;\n"
+"            if (sv>r_asa[i]) sv=r_asa[i];\n"
+"            acc+=sv*r_des[i];\n"
+"        }\n"
+"    }\n"
+"    for (uint j2=lid; j2<nl; j2+=tg) {\n"
+"        float d2=dminL[pose*nl+j2];\n"
+"        if (d2<=40.96f && d2>0.f && l_asa[j2]>0.f) {\n"
+"            float sv=-10.f*sqrt(d2)+65.f;\n"
+"            if (sv>l_asa[j2]) sv=l_asa[j2];\n"
+"            acc+=sv*l_des[j2];\n"
+"        }\n"
+"    }\n"
+"    sm[lid]=acc;\n"
+"    for (uint st=tg>>1; st>0; st>>=1) {\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        if (lid<st) sm[lid]+=sm[lid+st];\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (lid==0) S[pose]=sm[0];\n"
 "}\n";
 
 // ---------------------------------------------------------------------------
@@ -159,6 +255,11 @@ typedef struct LkMetalCtx {
     id<MTLComputePipelineState> __strong pipe;
     id<MTLCommandQueue> __strong queue;
     id<MTLBuffer> __strong bphi, bfd, bfg, brk, brp, bcs, bca, bci, bcf, blc, blp, bsz, bE, bV;
+    // CPYDOCK desolvation (mode & 16): receptor/ligand flag + des/asa arrays,
+    // per-pose min scratch and output S.
+    id<MTLBuffer> __strong brf, blf, brd, bra, bld, bla, bdm, bdl, bS;
+    id<MTLComputePipelineState> __strong pipeM, pipeS;
+    int has_solv;
     int tg;
     int nl, nr;
     int cap;      // current lc/out capacity in poses
@@ -181,7 +282,10 @@ void *lk_metal_ctx_create(
     float c_ox, float c_oy, float c_oz, float c_sp,
     const float *l_ele, const float *l_svdw, const float *l_vdwr,
     const unsigned char *l_heavy, int nl,
-    int tg) {
+    int tg, int mode,
+    const unsigned char *r_flag, const float *r_des, const float *r_asa,
+    const unsigned char *l_flag, const float *l_des, const float *l_asa) {
+    (void)r_flag; (void)r_des; (void)r_asa; (void)l_flag; (void)l_des; (void)l_asa;
     @autoreleasepool {
         NSError *err = nil;
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -204,7 +308,11 @@ void *lk_metal_ctx_create(
 
         int phiN = nx * ny * nz;
         int csN = (ncx + 1) * (ncy + 1) * (ncz + 1) + 1;   // cell_start incl. sentinel
-        if (phiN <= 0 || nr <= 0 || nl <= 0 || csN <= 0) return NULL;
+        if (nr <= 0 || nl <= 0 || csN <= 0) return NULL;
+        // VDW family has no far field (flags clear FAR): hand a 1-element
+        // placeholder grid — the kernel never samples phi without the FAR flag.
+        float zphi = 0.f;
+        if (phiN <= 0) { nx = ny = nz = 1; phiN = 1; phi = &zphi; }
 
         LkMetalCtx *c = calloc(1, sizeof(LkMetalCtx));
         if (!c) return NULL;
@@ -244,7 +352,7 @@ void *lk_metal_ctx_create(
         float fgeo[4] = {ox, oy, oz, sp};
         int32_t cgi[3] = {ncx, ncy, ncz};
         float cgf[4] = {c_ox, c_oy, c_oz, c_sp};
-        int32_t sizes[4] = {nr, nl, 0, 0};   // [3] = mode (0 = full)
+        int32_t sizes[4] = {nr, nl, 0, mode};   // [3] = per-family flags
 
         c->bphi = [device newBufferWithBytes:phi length:(NSUInteger)phiN * 4
                                      options:MTLResourceStorageModeShared];
@@ -263,12 +371,35 @@ void *lk_metal_ctx_create(
         c->bci = [device newBufferWithBytes:cgi length:12 options:MTLResourceStorageModeShared];
         c->bcf = [device newBufferWithBytes:cgf length:16 options:MTLResourceStorageModeShared];
         c->bsz = [device newBufferWithBytes:sizes length:16 options:MTLResourceStorageModeShared];
+        if (mode & 16) {
+            id<MTLFunction> fn2 = [lib newFunctionWithName:@"cpydock_min"];
+            id<MTLFunction> fn3 = [lib newFunctionWithName:@"cpydock_solv"];
+            if (!fn2 || !fn3) { fprintf(stderr, "[metal] cpydock kernels missing\n"); return NULL; }
+            c->pipeM = [device newComputePipelineStateWithFunction:fn2 error:&err];
+            c->pipeS = [device newComputePipelineStateWithFunction:fn3 error:&err];
+            if (!c->pipeM || !c->pipeS) return NULL;
+            c->brf = [device newBufferWithBytes:r_flag length:(NSUInteger)nr
+                                        options:MTLResourceStorageModeShared];
+            c->brd = [device newBufferWithBytes:r_des length:(NSUInteger)nr * 4
+                                        options:MTLResourceStorageModeShared];
+            c->bra = [device newBufferWithBytes:r_asa length:(NSUInteger)nr * 4
+                                        options:MTLResourceStorageModeShared];
+            c->blf = [device newBufferWithBytes:l_flag length:(NSUInteger)nl
+                                        options:MTLResourceStorageModeShared];
+            c->bld = [device newBufferWithBytes:l_des length:(NSUInteger)nl * 4
+                                        options:MTLResourceStorageModeShared];
+            c->bla = [device newBufferWithBytes:l_asa length:(NSUInteger)nl * 4
+                                        options:MTLResourceStorageModeShared];
+            if (!c->brf || !c->brd || !c->bra || !c->blf || !c->bld || !c->bla) return NULL;
+            c->has_solv = 1;
+        }
         return c;
     }
 }
 
 static int ensure_buffers(LkMetalCtx *c, int n_pose) {
-    if (n_pose <= c->cap && c->blc && c->bE && c->bV) return 0;
+    int solv_ready = !c->has_solv || (c->bdm && c->bdl && c->bS);
+    if (n_pose <= c->cap && c->blc && c->bE && c->bV && solv_ready) return 0;
     int need = n_pose > 32 ? n_pose : 32;   // small headroom; engine batches ~1000
     c->blc = [c->device newBufferWithLength:(NSUInteger)need * (NSUInteger)c->nl * 12
                                      options:MTLResourceStorageModeShared];
@@ -277,6 +408,15 @@ static int ensure_buffers(LkMetalCtx *c, int n_pose) {
     c->bV = [c->device newBufferWithLength:(NSUInteger)need * 4
                                    options:MTLResourceStorageModeShared];
     if (!c->blc || !c->bE || !c->bV) return -1;
+    if (c->has_solv) {
+        c->bdm = [c->device newBufferWithLength:(NSUInteger)need * (NSUInteger)c->nr * 4
+                                        options:MTLResourceStorageModeShared];
+        c->bdl = [c->device newBufferWithLength:(NSUInteger)need * (NSUInteger)c->nl * 4
+                                        options:MTLResourceStorageModeShared];
+        c->bS  = [c->device newBufferWithLength:(NSUInteger)need * 4
+                                        options:MTLResourceStorageModeShared];
+        if (!c->bdm || !c->bdl || !c->bS) return -1;
+    }
     c->cap = need;
     return 0;
 }
@@ -289,6 +429,7 @@ int lk_metal_score(void *vctx, const float *lc, int n_pose,
         if (ensure_buffers(c, n_pose) != 0) return -1;
         int32_t *szm = (int32_t *)c->bsz.contents;
         szm[2] = n_pose;
+        // sizes[3] keeps the family flags set at ctx_create
         memcpy(c->blc.contents, lc, (size_t)n_pose * (size_t)c->nl * 12);
         MTLSize groups = MTLSizeMake((NSUInteger)n_pose, 1, 1);
         MTLSize threads = MTLSizeMake((NSUInteger)c->tg, 1, 1);
@@ -310,6 +451,59 @@ int lk_metal_score(void *vctx, const float *lc, int n_pose,
     }
 }
 
+int lk_metal_cpydock_solv(void *vctx, const float *lc, int n_pose, double *outS) {
+    LkMetalCtx *c = (LkMetalCtx *)vctx;
+    if (!c || !c->has_solv || n_pose <= 0) return -1;
+    @autoreleasepool {
+        if (ensure_buffers(c, n_pose) != 0) return -1;
+        int32_t *szm = (int32_t *)c->bsz.contents;
+        szm[2] = n_pose;
+        memcpy(c->blc.contents, lc, (size_t)n_pose * (size_t)c->nl * 12);
+        id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl fillBuffer:c->bdm
+             range:NSMakeRange(0, (NSUInteger)n_pose * (NSUInteger)c->nr * 4)
+             value:0x7F];                     // float +inf bits for int-ordered atomic min
+        [bl endEncoding];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:c->pipeM];
+        [e setBuffer:c->brk offset:0 atIndex:3];
+        [e setBuffer:c->brf offset:0 atIndex:14];
+        [e setBuffer:c->bcs offset:0 atIndex:5];
+        [e setBuffer:c->bca offset:0 atIndex:6];
+        [e setBuffer:c->bci offset:0 atIndex:7];
+        [e setBuffer:c->bcf offset:0 atIndex:8];
+        [e setBuffer:c->blc offset:0 atIndex:9];
+        [e setBuffer:c->blf offset:0 atIndex:15];
+        [e setBuffer:c->bsz offset:0 atIndex:11];
+        [e setBuffer:c->bdm offset:0 atIndex:16];
+        [e setBuffer:c->bdl offset:0 atIndex:17];
+        uint nl = (uint)c->nl;
+        uint gx = (nl + 127u) / 128u;
+        [e dispatchThreadgroups:MTLSizeMake(gx, (NSUInteger)n_pose, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [e endEncoding];
+        e = [cb computeCommandEncoder];
+        [e setComputePipelineState:c->pipeS];
+        [e setBuffer:c->bdm offset:0 atIndex:0];
+        [e setBuffer:c->bdl offset:0 atIndex:1];
+        [e setBuffer:c->bra offset:0 atIndex:2];
+        [e setBuffer:c->brd offset:0 atIndex:3];
+        [e setBuffer:c->bla offset:0 atIndex:4];
+        [e setBuffer:c->bld offset:0 atIndex:5];
+        [e setBuffer:c->bsz offset:0 atIndex:6];
+        [e setBuffer:c->bS offset:0 atIndex:7];
+        [e dispatchThreadgroups:MTLSizeMake(1, (NSUInteger)n_pose, 1)
+            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        float *sP = c->bS.contents;
+        for (int k = 0; k < n_pose; k++) outS[k] = (double)sP[k];
+        return 0;
+    }
+}
+
 void lk_metal_ctx_destroy(void *vctx) {
     if (!vctx) return;
     LkMetalCtx *c = (LkMetalCtx *)vctx;
@@ -318,9 +512,12 @@ void lk_metal_ctx_destroy(void *vctx) {
         // owning autorelease scope is not enough for ivars created outside it,
         // so nil them out (ARC releases) before free.
         c->device = nil; c->lib = nil; c->pipe = nil; c->queue = nil;
+        c->pipeM = nil; c->pipeS = nil;
         c->bphi = nil; c->bfd = nil; c->bfg = nil; c->brk = nil; c->brp = nil;
         c->bcs = nil; c->bca = nil; c->bci = nil; c->bcf = nil; c->blc = nil;
         c->blp = nil; c->bsz = nil; c->bE = nil; c->bV = nil;
+        c->brf = nil; c->blf = nil; c->brd = nil; c->bra = nil; c->bld = nil;
+        c->bla = nil; c->bdm = nil; c->bdl = nil; c->bS = nil;
     }
     free(c);
 }
