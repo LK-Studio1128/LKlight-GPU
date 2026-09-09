@@ -121,7 +121,7 @@ impl MetalCtx {
         if nl == 0 {
             return None;
         }
-        let mut dummy: f32 = 0.0;
+        let dummy: f32 = 0.0;
         let (phi, nxd, nyd, nzd, oxf, oyf, ozf, spf) = match field {
             Some(f) if !f.phi.is_empty() => (
                 f.phi.as_ptr(), f.n[0] as i32, f.n[1] as i32, f.n[2] as i32,
@@ -417,7 +417,7 @@ impl MetalCtx {
             || solv_l.flag.len() != nl as usize {
             return None;
         }
-        let mut dummy: f32 = 0.0;
+        let dummy: f32 = 0.0;
         let (phi, nxd, nyd, nzd, oxf, oyf, ozf, spf) = match field {
             Some(f) if !f.phi.is_empty() => (
                 f.phi.as_ptr(), f.n[0] as i32, f.n[1] as i32, f.n[2] as i32,

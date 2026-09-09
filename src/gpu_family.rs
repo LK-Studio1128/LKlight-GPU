@@ -226,7 +226,7 @@ pub fn cuda_family_raw(
     }
     // Field is only needed when F_FAR is set (DNA/PYDOCK/CPYDOCK); VDW (flags=0)
     // passes a dummy — the kernel never samples phi without F_FAR.
-    let mut dummy: f32 = 0.0;
+    let dummy: f32 = 0.0;
     let (phi, nxd, nyd, nzd, oxf, oyf, ozf, spf) = match field {
         Some(f) if !f.phi.is_empty() => (
             f.phi.as_ptr(), f.n[0] as i32, f.n[1] as i32, f.n[2] as i32,
