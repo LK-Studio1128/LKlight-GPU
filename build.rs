@@ -71,13 +71,16 @@ fn main() {
         out_dir.join("libfarfield.a")
     };
 
-    // 1) nvcc: compile each kernel.
+    // 1) nvcc: compile each kernel. CI runners have no GPU, so allow
+    // CUDA_ARCH=sm_XX there; real release hosts keep the native default.
+    let cuda_arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "native".to_string());
+    let arch_flag = format!("-arch={cuda_arch}");
     let mut objs: Vec<PathBuf> = Vec::new();
     for src in ["src/cuda/far_field.cu", "src/cuda/full_score.cu"] {
         let stem = src.rsplit('/').next().unwrap().replace(".cu", "");
         let obj = out_dir.join(format!("{stem}.{obj_ext}"));
         let status = Command::new(&nvcc)
-            .args(["-O3", "-arch=native", "-c"])
+            .args(["-O3", arch_flag.as_str(), "-c"])
             .arg(src)
             .arg("-o")
             .arg(&obj)

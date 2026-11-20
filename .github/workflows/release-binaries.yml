@@ -1,0 +1,59 @@
+name: Build release binaries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-cuda:
+    runs-on: ubuntu-22.04
+    env:
+      CUDA_ARCH: sm_80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.2.0'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --features cuda
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LKlight-GPU-linux-x86_64-cuda
+          path: target/release/LKlight
+          if-no-files-found: error
+
+  windows-cuda:
+    runs-on: windows-2022
+    env:
+      CUDA_ARCH: sm_80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.2.0'
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --features cuda
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LKlight-GPU-windows-x64-cuda
+          path: target/release/LKlight.exe
+          if-no-files-found: error
+
+  mac-metal:
+    runs-on: macos-latest
+    env:
+      CUDA_ARCH: sm_80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo build --release --features metal
+      - run: cp target/release/LKlight target/release/LKlight-metal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LKlight-GPU-macos-metal
+          path: target/release/LKlight-metal
+          if-no-files-found: error
