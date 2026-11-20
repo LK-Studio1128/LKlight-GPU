@@ -34,6 +34,7 @@ jobs:
           cuda: '13.2.0'
           method: network
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+      - uses: ilammy/msvc-dev-cmd@v1
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --features cuda
       - uses: actions/upload-artifact@v4
