@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.3] — 2026-11-21
+
+### Fixed
+- Reject incompatible scoring methods for nucleic-acid inputs before CPU, CUDA
+  or Metal scoring.
+- Propagate worker failures to the process exit status.
+- Repair GPU test fixture initialization and align the CUDA DNA regression
+  tolerance with the grid implementation.
+
 ## [1.2.1] — 2026-09-06
 
 ### Added: Apple Silicon Metal GPU backend (opt-in `metal` feature)

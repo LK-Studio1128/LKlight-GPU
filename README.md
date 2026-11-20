@@ -1,6 +1,6 @@
 # LKlight-GPU
 
-**GPU-batched docking engine — LKlight-GPU v1.2.2.** Full-featured molecular
+**GPU-batched docking engine — LKlight-GPU v1.2.3.** Full-featured molecular
 docking for protein–nucleic-acid and protein–protein complexes with
 **NVIDIA-GPU (CUDA) batching on Windows and Linux and Apple-GPU (Metal)
 batching on Apple Silicon**. No compatible GPU present? The same binary
