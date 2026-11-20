@@ -32,8 +32,7 @@ jobs:
       - uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '13.2.0'
-          method: network
-          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          method: local
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --features cuda
