@@ -6,15 +6,16 @@ a misleading zero score.
 
 ## Fixed
 
-- Nucleic-acid inputs are validated before CPU or GPU scoring. Only `dna` and
-  `ddna` are accepted; incompatible methods fail clearly with exit code 2.
+- Nucleic-acid inputs are validated before CPU or GPU scoring. `dna`, `ddna`,
+  `pydock`, `cpydock`, and `vdw` are allowed; incompatible methods fail clearly
+  with exit code 2.
 - Worker-thread failures are reflected in the process exit status.
 - GPU test fixtures are initialized with the current cache/device fields, and
   the CUDA DNA regression uses the same relative tolerance as the CPU grid.
 
 ## Validation
 
-- `cargo test --release --lib`: **34 passed** on the CPU fallback build.
+- `cargo test --release --lib`: **36 passed** on the CPU fallback build.
 - Real protein–DNA regression: macOS CPU/Metal **-5186.346373**; Linux CUDA
   **-5186.345859** with `CUDA full-pose scoring ACTIVE`.
 - A 1×20×20 Linux CUDA docking produced ranked scores **37.411519–49.236627**
