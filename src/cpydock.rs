@@ -848,6 +848,12 @@ mod tests {
             use_anm: false,
             cells: OnceLock::new(),
             field: OnceLock::new(),
+            gpu_state: OnceLock::new(),
+            gpu: OnceLock::new(),
+            solv_r: OnceLock::new(),
+            solv_l: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_ctx3: OnceLock::new(),
         }
     }
 
